@@ -213,6 +213,11 @@ services:
       OIDC_SCOPES: openid email
       OIDC_PRINCIPAL_CLAIM: email
       OIDC_ALLOWED_EMAIL_DOMAIN: anduintransact.com
+      # Serve agent-published apps at /d/<name>/. Without this the portal
+      # answers {"error":"not_found"} for the whole /d/ family (index.ts:998).
+      # Safe only because PORTAL_PLAYGROUND is unset: anonymous visitors must
+      # never reach deployed apps.
+      PORTAL_DEPLOYMENTS_ENABLED: "1"
       PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET}
       CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
       PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET}
