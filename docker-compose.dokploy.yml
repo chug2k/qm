@@ -1,0 +1,207 @@
+# QM on the taincap Dokploy box.
+#
+# Topology notes (do not "simplify" these away):
+# - dind is the Docker daemon that hosts agent sandboxes. It is privileged.
+#   Its API binds to loopback only, so nothing outside this stack can reach it.
+# - core runs with network_mode: service:dind. The local sandbox backend
+#   publishes agent ports on the daemon host's loopback and dials
+#   http://127.0.0.1:<port>; sharing the network namespace is what makes
+#   that work. The "core" DNS name is a network alias on the dind service.
+# - portal is the only service with a public domain. It must be on both
+#   the default network and dokploy-network (Traefik).
+# - Every ${VAR} must exist in the Dokploy Environment tab; unmapped vars
+#   vanish silently.
+
+services:
+  pg:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: qm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  dind:
+    image: docker:27-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    # Full command override: the entrypoint adds --host=tcp://0.0.0.0:2375
+    # when only flags are passed. Spelling out dockerd keeps the API on
+    # loopback and the unix socket (used by the healthcheck).
+    command:
+      [
+        "dockerd",
+        "--host=unix:///var/run/docker.sock",
+        "--host=tcp://127.0.0.1:2375",
+        "--tls=false",
+      ]
+    volumes:
+      - dind-data:/var/lib/docker
+    networks:
+      default:
+        aliases: [core]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "docker", "version"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  sandbox-image:
+    image: docker:27-cli
+    network_mode: service:dind
+    environment:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      REVISION: ${SANDBOX_IMAGE_REVISION:-1}
+    volumes:
+      - ./:/repo:ro
+    entrypoint: ["/bin/sh", "/repo/deploy-dokploy/build-sandbox-image.sh"]
+    depends_on:
+      dind:
+        condition: service_healthy
+    restart: "no"
+
+  core:
+    build:
+      context: .
+      dockerfile: deploy-dokploy/core-dind.Dockerfile
+    network_mode: service:dind
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      SESSION_STORE: postgres
+      RUN_STORE: postgres
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@pg:5432/qm
+      ORG_ID: anduin
+      PUBLIC_WEB_URL: https://qm-cl.anduincapital.dev
+      WEB_UI_PUBLIC_URL: https://qm-cl.anduincapital.dev
+      HARNESS: claude
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      SANDBOX_BACKEND: local
+      LOCAL_SANDBOX_IMAGE: qm-sandbox-local:latest
+      LOCAL_SANDBOX_CPUS: "1"
+      LOCAL_SANDBOX_MEMORY_MB: "2048"
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
+      CAPABILITY_SECRET: ${CAPABILITY_SECRET}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET}
+      CONNECTOR_SECRET_KEY: ${CONNECTOR_SECRET_KEY}
+      SKILL_SIGNING_SECRET: ${SKILL_SIGNING_SECRET}
+      ADMIN_GRANTS: ${ADMIN_GRANTS}
+    volumes:
+      - coredata:/data
+    depends_on:
+      pg:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+      sandbox-image:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web-ui:
+    build:
+      context: .
+      dockerfile: deploy/web-ui/Dockerfile
+    environment:
+      PORT: "8080"
+      CORE_API_URL: http://core:8080
+      CORE_ORG_ID: anduin
+      WEB_UI_PUBLIC_URL: https://qm-cl.anduincapital.dev
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET}
+    depends_on:
+      - dind
+    restart: unless-stopped
+
+  admin:
+    build:
+      context: .
+      dockerfile: deploy/admin/Dockerfile
+    environment:
+      PORT: "8080"
+      CORE_API_URL: http://core:8080
+      CORE_ORG_ID: anduin
+      ADMIN_BASE_PATH: /admin
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET}
+    depends_on:
+      - dind
+    restart: unless-stopped
+
+  auth:
+    build:
+      context: .
+      dockerfile: deploy/auth/Dockerfile
+    environment:
+      PORT: "8080"
+      CORE_API_URL: http://core:8080
+      CORE_ORG_ID: anduin
+      AUTH_ISSUER: https://qm-cl.anduincapital.dev/idp
+      AUTH_CLIENT_ID: qm-portal
+      AUTH_REDIRECT_URI: https://qm-cl.anduincapital.dev/auth/callback
+      AUTH_ALLOWED_EMAIL_DOMAIN: anduintransact.com
+      AUTH_EMAIL_TRANSPORT: ${AUTH_EMAIL_TRANSPORT:-resend}
+      AUTH_EMAIL_FROM: ${AUTH_EMAIL_FROM}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
+      AUTH_SIGNING_JWK: ${AUTH_SIGNING_JWK}
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+    restart: unless-stopped
+
+  portal:
+    build:
+      context: .
+      dockerfile: deploy/portal/Dockerfile
+    environment:
+      PORT: "8080"
+      CORE_API_URL: http://core:8080
+      CORE_ORG_ID: anduin
+      PORTAL_PUBLIC_URL: https://qm-cl.anduincapital.dev
+      WEB_UI_UPSTREAM: http://web-ui:8080
+      ADMIN_UPSTREAM: http://admin:8080
+      AUTH_BROKER_UPSTREAM: http://auth:8080
+      AUTH_BROKER_PREFIX: /idp
+      OIDC_CLIENT_ID: qm-portal
+      OIDC_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+      OIDC_ISSUER: https://qm-cl.anduincapital.dev/idp
+      OIDC_AUTH_ENDPOINT: https://qm-cl.anduincapital.dev/idp/authorize
+      OIDC_TOKEN_ENDPOINT: http://auth:8080/token
+      OIDC_USERINFO_ENDPOINT: http://auth:8080/userinfo
+      OIDC_JWKS_URI: http://auth:8080/.well-known/jwks.json
+      OIDC_SCOPES: openid email
+      OIDC_PRINCIPAL_CLAIM: email
+      OIDC_ALLOWED_EMAIL_DOMAIN: anduintransact.com
+      PORTAL_SESSION_SECRET: ${PORTAL_SESSION_SECRET}
+      CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
+      PORTAL_IDENTITY_SECRET: ${PORTAL_IDENTITY_SECRET}
+    networks:
+      - default
+      - dokploy-network
+    depends_on:
+      - dind
+      - web-ui
+      - auth
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  coredata:
+  dind-data:
+
+networks:
+  default:
+  dokploy-network:
+    external: true
