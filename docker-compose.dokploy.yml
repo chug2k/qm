@@ -55,6 +55,21 @@ services:
       retries: 30
       start_period: 30s
 
+# compose-readLogs is broken on this Dokploy box. buildlog's healthcheck
+  # tails the builder's log file, and docker-getConfig exposes the last
+  # healthcheck outputs in State.Health.Log — a readable log channel.
+  buildlog:
+    image: alpine:3.21
+    command: ["sh", "-c", "touch /log/build.log && sleep infinity"]
+    volumes:
+      - buildlog:/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo '-- tail of build.log --'; tail -c 3000 /log/build.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   sandbox-image:
     image: docker:27-cli
     network_mode: service:dind
@@ -63,7 +78,13 @@ services:
       REVISION: ${SANDBOX_IMAGE_REVISION:-1}
     volumes:
       - ./:/repo:ro
-    entrypoint: ["/bin/sh", "/repo/deploy-dokploy/build-sandbox-image.sh"]
+      - buildlog:/log
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "/bin/sh /repo/deploy-dokploy/build-sandbox-image.sh >/log/build.log 2>&1",
+      ]
     depends_on:
       dind:
         condition: service_healthy
@@ -153,12 +174,20 @@ services:
       AUTH_EMAIL_FROM: ${AUTH_EMAIL_FROM}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       CORE_SIGNING_SECRET: ${CORE_SIGNING_SECRET}
       AUTH_SIGNING_JWK: ${AUTH_SIGNING_JWK}
       AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET}
       AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+    # portal only accepts broker URLs on hosts it considers private
+    # (.internal/.flycast/.local/localhost); a bare compose service name
+    # fails its boot check, hence the alias.
+    networks:
+      default:
+        aliases: [auth.internal]
     restart: unless-stopped
 
   portal:
@@ -172,15 +201,15 @@ services:
       PORTAL_PUBLIC_URL: https://qm-cl.anduincapital.dev
       WEB_UI_UPSTREAM: http://web-ui:8080
       ADMIN_UPSTREAM: http://admin:8080
-      AUTH_BROKER_UPSTREAM: http://auth:8080
+      AUTH_BROKER_UPSTREAM: http://auth.internal:8080
       AUTH_BROKER_PREFIX: /idp
       OIDC_CLIENT_ID: qm-portal
       OIDC_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
       OIDC_ISSUER: https://qm-cl.anduincapital.dev/idp
       OIDC_AUTH_ENDPOINT: https://qm-cl.anduincapital.dev/idp/authorize
-      OIDC_TOKEN_ENDPOINT: http://auth:8080/token
-      OIDC_USERINFO_ENDPOINT: http://auth:8080/userinfo
-      OIDC_JWKS_URI: http://auth:8080/.well-known/jwks.json
+      OIDC_TOKEN_ENDPOINT: http://auth.internal:8080/token
+      OIDC_USERINFO_ENDPOINT: http://auth.internal:8080/userinfo
+      OIDC_JWKS_URI: http://auth.internal:8080/.well-known/jwks.json
       OIDC_SCOPES: openid email
       OIDC_PRINCIPAL_CLAIM: email
       OIDC_ALLOWED_EMAIL_DOMAIN: anduintransact.com
@@ -200,6 +229,7 @@ volumes:
   pgdata:
   coredata:
   dind-data:
+  buildlog:
 
 networks:
   default:
