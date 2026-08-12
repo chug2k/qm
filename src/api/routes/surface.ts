@@ -1038,7 +1038,14 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     webuiModels: configuredPicker.length ? configuredPicker : allowed,
     baseModel: resolvedBase,
     harnessId,
-    ...(managedKeys ? { modelProviderConfigured: Object.values(managedKeys).some(Boolean) } : {}),
+    ...(managedKeys
+      ? {
+          // Harness-aware: HARNESS=claude serves turns on CLAUDE_CODE_OAUTH_TOKEN
+          // with no provider API key, and modelProviderAvailabilityFor already
+          // reports all providers available for it.
+          modelProviderConfigured: Object.values(modelProviderAvailabilityFor(harnessId, managedKeys)).some(Boolean),
+        }
+      : {}),
     externalSlackParticipants,
     ...(Object.keys(resolvedBranding).length ? { branding: resolvedBranding } : {}),
   });
