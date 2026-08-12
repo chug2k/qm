@@ -44,6 +44,13 @@ services:
       ]
     volumes:
       - dind-data:/var/lib/docker
+      # The deploy provider runs `docker run -v <snapshotDir>:/app:ro` against
+      # THIS daemon, and a daemon resolves bind sources on its own filesystem.
+      # snapshotDir lives under core's /data, so dind must see the same volume
+      # at the same path or docker silently mounts an empty dir and the app
+      # exits instantly (core then answers 502 "deployment unreachable").
+      # Read-only: app snapshots are mounted :ro anyway.
+      - coredata:/data:ro
     networks:
       default:
         aliases: [core]
