@@ -106,7 +106,7 @@ services:
     network_mode: service:dind
     environment:
       DOCKER_HOST: tcp://127.0.0.1:2375
-      PROBE_REVISION: "1"
+      PROBE_REVISION: "2"
     entrypoint:
       [
         "/bin/sh",
