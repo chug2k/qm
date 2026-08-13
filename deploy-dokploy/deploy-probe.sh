@@ -50,6 +50,7 @@ echo "$body" | head -c 150
 echo ""
 
 echo "== gatus relay: sandbox-equivalent end-to-end =="
+docker pull -q alpine:3.21 >/dev/null 2>&1
 docker network create probe-net >/dev/null 2>&1
 docker run --rm --network probe-net --add-host=host.docker.internal:host-gateway \
   alpine:3.21 wget -q -O - -T 5 "http://host.docker.internal:18080/api/v1/endpoints/statuses" 2>&1 | head -c 150
