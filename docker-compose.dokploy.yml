@@ -97,6 +97,39 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Agent sandboxes (containers inside dind) cannot resolve dokploy-network
+  # names: their DNS and routing end at dind's netns, and dind is only on
+  # this project's default network. But every sandbox is created with
+  # --add-host=host.docker.internal:host-gateway (src/sandbox/local-sandbox.ts),
+  # which points into dind's netns. So a listener in dind's netns is the one
+  # doorway sandboxes can always reach without DNS.
+  #
+  # gatus-bridge listens there and forwards to gatus-relay, which sits on
+  # both networks and forwards to the Gatus container on dokploy-network.
+  # Sandboxes read Gatus as:  http://host.docker.internal:18080/api/v1/endpoints/statuses
+  #
+  # Two hops on purpose: attaching dind itself to dokploy-network would give
+  # every sandbox IP-level reach to EVERY container on the shared network.
+  # This exposes exactly one read-only upstream and nothing else.
+  gatus-relay:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:8080,fork,reuseaddr", "TCP:compose-index-mobile-system-i1cg91-gatus-1:8080"]
+    networks:
+      - default
+      - dokploy-network
+    restart: unless-stopped
+
+  gatus-bridge:
+    image: alpine/socat:latest
+    network_mode: service:dind
+    command: ["TCP-LISTEN:18080,fork,reuseaddr", "TCP:gatus-relay:8080"]
+    depends_on:
+      dind:
+        condition: service_healthy
+      gatus-relay:
+        condition: service_started
+    restart: unless-stopped
+
   # Transient diagnostic probe: inspects agent-deploy containers inside dind
   # and writes findings to /log/probe.log. Read via this service's healthcheck
   # output (docker-getConfig State.Health.Log), same channel as buildlog.
@@ -106,7 +139,7 @@ services:
     network_mode: service:dind
     environment:
       DOCKER_HOST: tcp://127.0.0.1:2375
-      PROBE_REVISION: "2"
+      PROBE_REVISION: "3"
     entrypoint:
       [
         "/bin/sh",
