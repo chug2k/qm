@@ -97,6 +97,35 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Transient diagnostic probe: inspects agent-deploy containers inside dind
+  # and writes findings to /log/probe.log. Read via this service's healthcheck
+  # output (docker-getConfig State.Health.Log), same channel as buildlog.
+  # Bump PROBE_REVISION to re-run. Remove after the deploy 502s are fixed.
+  deploy-probe:
+    image: docker:27-cli
+    network_mode: service:dind
+    environment:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      PROBE_REVISION: "1"
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "/bin/sh /repo/deploy-dokploy/deploy-probe.sh >/log/probe.log 2>&1; sleep infinity",
+      ]
+    volumes:
+      - ./:/repo:ro
+      - buildlog:/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo '-- tail of probe.log --'; tail -c 3800 /log/probe.log"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      dind:
+        condition: service_healthy
+    restart: "no"
+
   core:
     build:
       context: .
