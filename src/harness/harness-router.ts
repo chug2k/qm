@@ -1,12 +1,34 @@
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
-import { defaultModelForHarness, isHarnessId, modelSupportedByHarness, type HarnessId } from "../model/pi-models.ts";
+import {
+  defaultModelForHarness,
+  fastModeModelIds,
+  harnessSupportsFastMode,
+  isHarnessId,
+  modelSupportedByHarness,
+  resolveModel,
+  thinkingLevelsForHarness,
+  modelUnavailableReason,
+  type HarnessId,
+} from "../model/pi-models.ts";
 import type { ScopeId } from "../types.ts";
-import type { Harness, HarnessTurnInput } from "./harness.ts";
+import type { Harness, HarnessTurnInput, RuntimeChoice } from "./harness.ts";
+import { withTapedEntryMirrors } from "./harness-shared.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 
-export interface RuntimeChoice {
-  harnessId: HarnessId;
-  modelId: string;
+function normalizeRuntimeChoice(choice: RuntimeChoice): RuntimeChoice {
+  return {
+    harnessId: choice.harnessId,
+    modelId: choice.modelId,
+    ...(choice.effortLevel && thinkingLevelsForHarness(choice.harnessId).includes(choice.effortLevel)
+      ? { effortLevel: choice.effortLevel }
+      : {}),
+    ...(typeof choice.fastMode === "boolean"
+      ? {
+          fastMode:
+            choice.fastMode && harnessSupportsFastMode(choice.harnessId) && fastModeModelIds().includes(choice.modelId),
+        }
+      : {}),
+  };
 }
 
 export function resolveRuntimeChoice(
@@ -17,12 +39,24 @@ export function resolveRuntimeChoice(
   requested?: Partial<RuntimeChoice>,
 ): RuntimeChoice {
   const approved = config.getApprovedHarnesses() ?? [fallback.harnessId];
+  if (approved.length === 0) throw new NonRetryableTurnError("No harnesses are approved");
   const orgStored = config.getRuntimeSelection(orgScopeId);
   const orgLegacy = config.getBaseModel(orgScopeId);
-  const configuredOrg =
+  const configuredOrg: RuntimeChoice =
     orgStored && isHarnessId(orgStored.harnessId)
-      ? { harnessId: orgStored.harnessId, modelId: orgStored.modelId }
+      ? {
+          harnessId: orgStored.harnessId,
+          modelId: orgStored.modelId,
+          ...(orgStored.effortLevel ? { effortLevel: orgStored.effortLevel } : {}),
+          ...(typeof orgStored.fastMode === "boolean" ? { fastMode: orgStored.fastMode } : {}),
+        }
       : { harnessId: fallback.harnessId, modelId: orgLegacy ?? fallback.modelId };
+  const configuredId =
+    requested?.modelId ??
+    (scope !== orgScopeId ? (config.getRuntimeSelection(scope)?.modelId ?? config.getBaseModel(scope)) : null) ??
+    configuredOrg.modelId;
+  const unavailableReason = modelUnavailableReason(configuredId);
+  if (unavailableReason) throw new NonRetryableTurnError(`${configuredId}: ${unavailableReason}`);
   const firstApproved = approved.find(isHarnessId) ?? fallback.harnessId;
   const safeFallback =
     approved.includes(fallback.harnessId) && modelSupportedByHarness(fallback.modelId, fallback.harnessId)
@@ -35,22 +69,24 @@ export function resolveRuntimeChoice(
       : safeFallback;
   const scopedStored = scope === orgScopeId ? null : config.getRuntimeSelection(scope);
   const scopedLegacy = scope === orgScopeId ? null : config.getBaseModel(scope);
-  let inherited = org;
+  let inherited: RuntimeChoice = org;
   if (scopedStored && isHarnessId(scopedStored.harnessId)) {
-    inherited = { harnessId: scopedStored.harnessId, modelId: scopedStored.modelId };
+    inherited = {
+      harnessId: scopedStored.harnessId,
+      modelId: scopedStored.modelId,
+      ...(scopedStored.effortLevel ? { effortLevel: scopedStored.effortLevel } : {}),
+      ...(typeof scopedStored.fastMode === "boolean" ? { fastMode: scopedStored.fastMode } : {}),
+    };
   } else if (scopedLegacy) {
     inherited = { harnessId: fallback.harnessId, modelId: scopedLegacy };
   }
-  const choice =
-    requested?.harnessId || requested?.modelId
-      ? { harnessId: requested.harnessId ?? inherited.harnessId, modelId: requested.modelId ?? inherited.modelId }
-      : inherited;
+  const choice = { ...inherited, ...requested };
   if (!approved.includes(choice.harnessId) || !modelSupportedByHarness(choice.modelId, choice.harnessId)) {
     if (requested?.harnessId || requested?.modelId)
       throw new NonRetryableTurnError(`runtime ${choice.harnessId}/${choice.modelId} is not approved`);
-    return org;
+    return normalizeRuntimeChoice({ ...org, ...requested });
   }
-  return choice;
+  return normalizeRuntimeChoice(choice);
 }
 
 export async function resolveRuntimeChoiceDurable(
@@ -59,6 +95,7 @@ export async function resolveRuntimeChoiceDurable(
   scope: ScopeId,
   fallback: RuntimeChoice,
   requested?: Partial<RuntimeChoice>,
+  hydrateModelCatalog?: () => Promise<unknown>,
 ): Promise<RuntimeChoice> {
   const approved = (await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId];
   const [orgStored, scopedStored, orgLegacy, scopedLegacy] = await Promise.all([
@@ -67,6 +104,10 @@ export async function resolveRuntimeChoiceDurable(
     config.getBaseModelOwnDurable(orgScopeId),
     scope === orgScopeId ? null : config.getBaseModelOwnDurable(scope),
   ]);
+  if (hydrateModelCatalog) {
+    const candidates = [requested?.modelId, scopedStored?.modelId, orgStored?.modelId];
+    if (candidates.some((modelId) => modelId && !resolveModel(modelId))) await hydrateModelCatalog();
+  }
   const view: Pick<ScopedConfigStore, "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel"> = {
     getApprovedHarnesses: () => approved,
     getRuntimeSelection: (id: ScopeId) => {
@@ -89,7 +130,13 @@ export function createHarnessRouter(
   const lastHarness = new Map<string, HarnessId>();
   return {
     profile: utility.profile,
-    models: utility.models,
+    models: {
+      ...utility.models,
+      async screenSecurity(input) {
+        const adapter = input.harnessId && isHarnessId(input.harnessId) ? adapters.get(input.harnessId) : utility;
+        return adapter?.models.screenSecurity?.(input);
+      },
+    },
     tools: utility.tools,
     turns: {
       async runTurn(input) {
@@ -102,7 +149,10 @@ export function createHarnessRouter(
           await adapter.turns.resetSession?.(input.session.id);
         }
         lastHarness.set(input.session.id, choice.harnessId);
-        return adapter.turns.runTurn({ ...input, harness: choice.harnessId, model: choice.modelId });
+        const dispatched: HarnessTurnInput = { ...input, runtime: choice };
+        return adapter.turns.runTurn(
+          adapter.profile.capabilities.has("native-tape") ? dispatched : withTapedEntryMirrors(dispatched),
+        );
       },
       async resetSession(sessionId) {
         lastHarness.delete(sessionId);

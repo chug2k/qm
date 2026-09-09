@@ -4,7 +4,14 @@ import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/po
 
 const IDENTITY_TTL_MS = 60_000;
 
-const FORWARD_REQUEST_HEADERS = ["content-type", "accept", "accept-language", "user-agent", "accept-encoding"];
+const FORWARD_REQUEST_HEADERS = [
+  "content-type",
+  "accept",
+  "accept-language",
+  "user-agent",
+  "accept-encoding",
+  "sec-fetch-dest",
+];
 
 const DROP_RESPONSE_HEADERS = new Set([
   "connection",
@@ -32,10 +39,23 @@ export function requestPort(upstream: URL): string | undefined {
   return upstream.port || undefined;
 }
 
+function declaresFrameAncestors(headers: Record<string, string | string[]>): boolean {
+  const csp = headers["content-security-policy"];
+  const text = typeof csp === "string" ? csp : (csp?.join(",") ?? "");
+  return /(^|[;,])\s*frame-ancestors\s/i.test(text);
+}
+
 function relay(
   req: IncomingMessage,
   res: ServerResponse,
-  target: { protocol: string; hostname: string; port?: string; path: string; headers: Record<string, string> },
+  target: {
+    protocol: string;
+    hostname: string;
+    port?: string;
+    path: string;
+    headers: Record<string, string>;
+    honorFramePolicy?: boolean;
+  },
 ): void {
   const up = httpRequest(
     {
@@ -53,6 +73,7 @@ function relay(
         if (DROP_RESPONSE_HEADERS.has(k.toLowerCase())) continue;
         out[k] = v;
       }
+      if (target.honorFramePolicy && declaresFrameAncestors(out)) res.removeHeader("x-frame-options");
       res.writeHead(upRes.statusCode ?? 502, out);
       upRes.on("error", () => res.destroy());
       upRes.pipe(res);
@@ -111,13 +132,28 @@ export function proxyToSurface(req: IncomingMessage, res: ServerResponse, t: Sur
     port: requestPort(upstream),
     path: `${t.forwardPath}${t.search}`,
     headers,
+    honorFramePolicy: true,
   });
 }
+
+export const FORWARD_WEBHOOK_HEADERS = [
+  "content-type",
+  "x-hub-signature-256",
+  "x-github-event",
+  "x-github-delivery",
+  "x-github-hook-id",
+  "x-slack-signature",
+  "x-slack-request-timestamp",
+  "stripe-signature",
+  "x-signature",
+  "x-delivery-id",
+];
 
 export const FORWARD_AGENT_API_HEADERS = [
   "content-type",
   "content-length",
   "accept",
+  "accept-encoding",
   "x-agent-capability",
   "x-content-sha256",
   "git-protocol",

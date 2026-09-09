@@ -25,7 +25,10 @@ export function createDeploymentMethods(
   | "restoreDeployment"
   | "renameDeployment"
   | "setDeploymentDisplayName"
+  | "setDeploymentAlwaysOn"
+  | "keepAlwaysOnWarm"
   | "reachDeployment"
+  | "deploymentLogsFor"
   | "deploymentGitRepoPath"
   | "runDeploymentGitPush"
   | "deploymentGitUrlFor"
@@ -91,12 +94,28 @@ export function createDeploymentMethods(
     setDeploymentDisplayName(id, displayName) {
       return deps.deploy.setDeploymentDisplayName(id, displayName);
     },
+    setDeploymentAlwaysOn(id, alwaysOn) {
+      return deps.deploy.setDeploymentAlwaysOn(id, alwaysOn);
+    },
+    keepAlwaysOnWarm() {
+      return deps.deploy.keepAlwaysOnWarm();
+    },
     async reachDeployment(id, principalId, opts): Promise<Reach> {
       if (opts?.bypassAcl) return deps.deploy.reachDeployment(id, principalId, opts);
       const deployment = await deps.deploy.getDeployment(id);
       if (!deployment) return { status: "not_found" };
       if (!(await principalCanReadDeployment(deployment, principalId))) return { status: "denied" };
       return deps.deploy.reachDeployment(id, principalId, { bypassAcl: true });
+    },
+    async deploymentLogsFor(
+      id,
+      principalId,
+      opts,
+    ): Promise<{ status: "ok"; logs: string | null } | { status: "not_found" | "denied" }> {
+      const deployment = await deps.deploy.getDeployment(id);
+      if (!deployment) return { status: "not_found" };
+      if (!(await principalCanReadDeployment(deployment, principalId))) return { status: "denied" };
+      return { status: "ok", logs: await deps.deploy.deploymentLogs(id, opts) };
     },
     deploymentGitRepoPath(id) {
       return deps.deploy.gitRepoPath(id);

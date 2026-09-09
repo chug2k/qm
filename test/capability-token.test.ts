@@ -24,6 +24,23 @@ test("mint → verify round-trips the claims", async () => {
   assert.deepEqual(got, { orgId: "default-org", ...c });
 });
 
+test("grants round-trip and reject malformed claims", async () => {
+  const granted = claims({ grants: ["admin.sessions.read"] });
+  assert.deepEqual(await verifyCapabilityToken(await mintCapabilityToken(granted, SECRET), SECRET), {
+    orgId: "default-org",
+    ...granted,
+  });
+  for (const grants of ["admin.sessions.read", ["admin.sessions.read", 1]]) {
+    assert.equal(
+      await verifyCapabilityToken(
+        await mintCapabilityToken(claims({ grants } as unknown as Partial<CapabilityClaims>), SECRET),
+        SECRET,
+      ),
+      null,
+    );
+  }
+});
+
 test("timezone claims must be valid IANA timezone strings", async () => {
   const c = claims({ timezone: "America/Los_Angeles" });
   assert.deepEqual(await verifyCapabilityToken(await mintCapabilityToken(c, SECRET), SECRET), {
@@ -102,4 +119,16 @@ test("blob-transfer verification enforces its audience-specific grant", async ()
     }),
     null,
   );
+});
+
+test("a deployment claim round-trips and must be a non-empty string", async () => {
+  const c = claims({ deployment: "dpl-1" });
+  assert.deepEqual(await verifyCapabilityToken(await mintCapabilityToken(c, SECRET), SECRET), {
+    orgId: "default-org",
+    ...c,
+  });
+  for (const deployment of [7, "", null] as unknown[]) {
+    const token = await mintCapabilityToken(claims({ deployment } as Partial<CapabilityClaims>), SECRET);
+    assert.equal(await verifyCapabilityToken(token, SECRET), null, `deployment=${JSON.stringify(deployment)}`);
+  }
 });

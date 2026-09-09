@@ -1,204 +1,190 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
-import type { Deployment, DeploymentVersion } from "../src/deploy/deploy-store.ts";
+import { test } from "node:test";
+import { createDockerDeployProvider, dockerDaemonFailure } from "../src/deploy/docker-deploy-provider.ts";
+import { createDeployStore } from "../src/deploy/deploy-store.ts";
+import type { DockerExec } from "../src/sandbox/docker-exec.ts";
 import { scopeId } from "../src/types.ts";
 
-interface FakeContainer {
-  status: "running" | "exited" | "created";
-  exitCode: number;
-  port: number | null;
-  logs: string;
-  listening: boolean;
-}
-
-interface FakeDind {
-  containers: Map<string, FakeContainer>;
-  /** host ports held by containers that predate this provider (e.g. before a core restart) */
-  foreignPorts: Set<number>;
-  /** lines returned by `docker ps --filter name=agent-deploy- --format '{{.Names}} {{.Ports}}'` */
-  psLines: string[];
-  /** what a `docker run` should produce for the NEXT container, by deployment name */
-  onRun: (name: string) => Omit<FakeContainer, "port">;
-  runArgs: string[][];
-}
-
-function fakeDind(): FakeDind {
-  const self: FakeDind = {
-    containers: new Map(),
-    foreignPorts: new Set(),
-    psLines: [],
-    onRun: () => ({ status: "running", exitCode: 0, logs: "", listening: true }),
-    runArgs: [],
+test("Docker deployments use isolated networks and remove them on destroy", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    return {
+      code: args[1] === "inspect" ? 1 : 0,
+      stdout: "",
+      stderr: args[1] === "inspect" ? "No such network" : "",
+    };
   };
-  return self;
-}
-
-function dexecFor(dind: FakeDind) {
-  return async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
-    const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
-    const fail = (stderr: string) => ({ code: 1, stdout: "", stderr });
-    const [cmd, ...rest] = args;
-    switch (cmd) {
-      case "network":
-        return ok();
-      case "ps":
-        return ok(dind.psLines.join("\n"));
-      case "rm": {
-        const name = rest[rest.length - 1]!;
-        dind.containers.delete(name);
-        return ok();
-      }
-      case "run": {
-        dind.runArgs.push(args);
-        const nameAt = args.indexOf("--name");
-        const name = args[nameAt + 1]!;
-        const pAt = args.indexOf("-p");
-        const hostPort = Number(args[pAt + 1]!.split(":")[1]);
-        if (dind.foreignPorts.has(hostPort)) {
-          return fail(
-            `docker: Error response from daemon: driver failed programming external connectivity: Bind for 127.0.0.1:${hostPort} failed: port is already allocated.`,
-          );
-        }
-        for (const c of dind.containers.values()) {
-          if (c.port === hostPort && c.status === "running") {
-            return fail(`Bind for 127.0.0.1:${hostPort} failed: port is already allocated`);
-          }
-        }
-        dind.containers.set(name, { ...dind.onRun(name), port: hostPort });
-        return ok("deadbeef");
-      }
-      case "inspect": {
-        const name = rest[rest.length - 1]!;
-        const c = dind.containers.get(name);
-        if (!c) return fail(`Error: No such object: ${name}`);
-        return ok(`${c.status} ${c.exitCode}`);
-      }
-      case "logs": {
-        const name = rest[rest.length - 1]!;
-        const c = dind.containers.get(name);
-        if (!c) return fail(`Error: No such container: ${name}`);
-        return { code: 0, stdout: "", stderr: c.logs };
-      }
-      default:
-        return fail(`fake dind: unhandled command ${cmd}`);
-    }
-  };
-}
-
-function dialFor(dind: FakeDind) {
-  return async (_host: string, port: number): Promise<boolean> => {
-    for (const c of dind.containers.values()) {
-      if (c.port === port && c.status === "running" && c.listening) return true;
-    }
-    return false;
-  };
-}
-
-function provider(dind: FakeDind) {
-  return createDockerDeployProvider({
-    dockerExec: dexecFor(dind),
-    dial: dialFor(dind),
-    readyTimeoutMs: 300,
-    readyPollMs: 10,
-  });
-}
-
-let seq = 0;
-function deployment(id: string): { d: Deployment; v: DeploymentVersion } {
-  const v: DeploymentVersion = {
-    version: 1,
-    createdAt: Date.now(),
+  const store = createDeployStore();
+  const first = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
     entrypoint: "node server.js",
-    snapshotDir: `/data/deployments/${id}`,
+    snapshotDir: "/snap/one",
+  });
+  const second = await store.create({
+    ownerScopeId: scopeId("personal", "U2"),
+    createdBy: "U2",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/two",
+  });
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  await provider.apply(first, first.versions[0]!);
+  await provider.apply(second, second.versions[0]!);
+  await provider.destroy(first);
+
+  const firstName = `agent-deploy-${first.id.slice(0, 12)}`;
+  const secondName = `agent-deploy-${second.id.slice(0, 12)}`;
+  assert.ok(calls.some((args) => args.join(" ") === `network create ${firstName}-net`));
+  assert.ok(calls.some((args) => args.join(" ") === `network create ${secondName}-net`));
+  assert.ok(calls.some((args) => args.join(" ").includes(`--name ${firstName} --network ${firstName}-net`)));
+  assert.ok(calls.some((args) => args.join(" ").includes(`--name ${secondName} --network ${secondName}-net`)));
+  assert.ok(calls.some((args) => args.join(" ") === `network rm ${firstName}-net`));
+});
+
+test("Docker provider migrates running deployments off the legacy shared network", async () => {
+  const calls: string[][] = [];
+  let containerName = "";
+  let connectAttempts = 0;
+  let targetAttached = false;
+  let legacyAttached = true;
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
+      return { code: 0, stdout: legacyAttached ? `${containerName}\n` : "", stderr: "" };
+    }
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "network" && args[1] === "connect" && ++connectAttempts === 1) {
+      return { code: 1, stdout: "", stderr: "transient" };
+    }
+    if (args[0] === "network" && args[1] === "connect") targetAttached = true;
+    if (args[0] === "network" && args[1] === "disconnect") legacyAttached = false;
+    if (args[0] === "inspect") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ...(legacyAttached ? { "agent-deploynet": {} } : {}),
+          ...(targetAttached ? { [`${containerName}-net`]: {} } : {}),
+        }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
   };
-  const d: Deployment = {
-    id,
-    ownerScopeId: scopeId("personal", `p${seq++}@example.com`),
-    createdBy: "tester",
-    currentVersion: 1,
-    status: "running",
-    endpoint: null,
-    versions: [v],
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/legacy",
+  });
+  containerName = `agent-deploy-${deployment.id.slice(0, 12)}`;
+  await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
+  const running = (await store.get(deployment.id))!;
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  assert.deepEqual(await provider.resolveEndpoint!(running, running.versions[0]!), running.endpoint);
+  assert.equal(connectAttempts, 2);
+  assert.ok(calls.some((args) => args.join(" ") === `network connect ${containerName}-net ${containerName}`));
+  assert.ok(calls.some((args) => args.join(" ") === `network disconnect agent-deploynet ${containerName}`));
+});
+
+test("constructing a Docker provider does not inspect or migrate unrelated deployments", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    return { code: 0, stdout: "", stderr: "" };
   };
-  return { d, v };
-}
 
-test("apply skips host ports held by containers that predate the provider", async () => {
-  const dind = fakeDind();
-  // a live deployment container from before a core restart holds 9200
-  dind.psLines = ["agent-deploy-c8d44474-cd5 127.0.0.1:9200->8080/tcp"];
-  dind.containers.set("agent-deploy-c8d44474-cd5", {
-    status: "running",
-    exitCode: 0,
-    port: 9200,
-    logs: "",
-    listening: true,
+  createDockerDeployProvider({ dockerExec });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, []);
+});
+
+test("an unrelated legacy migration failure does not block a new deployment", async () => {
+  const dockerExec: DockerExec = async (args) => {
+    if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
+      return { code: 0, stdout: "agent-deploy-broken\n", stderr: "" };
+    }
+    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "daemon unavailable" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/new",
   });
-  const p = provider(dind);
-  const { d, v } = deployment("eaf6b528-acc4-4000-8000-000000000001");
-  const endpoint = await p.apply(d, v);
-  assert.equal(endpoint.port, 9201);
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  await assert.doesNotReject(provider.apply(deployment, deployment.versions[0]!));
 });
 
-test("apply reuses the seeded port when republishing the same deployment", async () => {
-  const dind = fakeDind();
-  dind.psLines = ["agent-deploy-c8d44474-cd5 127.0.0.1:9200->8080/tcp"];
-  dind.containers.set("agent-deploy-c8d44474-cd5", {
-    status: "running",
-    exitCode: 0,
-    port: 9200,
-    logs: "",
-    listening: true,
+test("a transient target inspection failure does not report the deployment missing", async () => {
+  const dockerExec: DockerExec = async (args) => {
+    if (args.join(" ") === "network inspect --format {{range .Containers}}{{println .Name}}{{end}} agent-deploynet") {
+      return { code: 1, stdout: "", stderr: "No such network" };
+    }
+    if (args[0] === "inspect") return { code: 1, stdout: "", stderr: "daemon unavailable" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const store = createDeployStore();
+  const deployment = await store.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node server.js",
+    snapshotDir: "/snap/running",
   });
-  const p = provider(dind);
-  const { d, v } = deployment("c8d44474-cd56-4b3c-8042-51fdea0f3a9f");
-  const endpoint = await p.apply(d, v);
-  assert.equal(endpoint.port, 9200);
+  await store.setEndpoint(deployment.id, { host: "127.0.0.1", port: 9200 });
+  const running = (await store.get(deployment.id))!;
+  const provider = createDockerDeployProvider({ dockerExec });
+
+  await assert.rejects(provider.resolveEndpoint!(running, running.versions[0]!), /daemon unavailable/);
 });
 
-test("apply retries on port-in-use instead of recycling the same port", async () => {
-  const dind = fakeDind();
-  // something outside the allocator's knowledge holds 9200 (ps did not report it)
-  dind.foreignPorts.add(9200);
-  const p = provider(dind);
-  const { d, v } = deployment("aaaaaaaa-1111-4000-8000-000000000001");
-  const endpoint = await p.apply(d, v);
-  assert.equal(endpoint.port, 9201);
-  // the poisoned port must not be handed to the next deployment either
-  const { d: d2, v: v2 } = deployment("bbbbbbbb-2222-4000-8000-000000000002");
-  const endpoint2 = await p.apply(d2, v2);
-  assert.equal(endpoint2.port, 9202);
+test("the daemon probe reports nothing when Docker answers", async () => {
+  const calls: string[][] = [];
+  const dockerExec: DockerExec = async (args) => {
+    calls.push(args);
+    return { code: 0, stdout: "29.1.3\n", stderr: "" };
+  };
+
+  assert.equal(await dockerDaemonFailure({ dockerExec }), null);
+  assert.deepEqual(calls, [["version", "-f", "{{.Server.Version}}"]]);
 });
 
-test("apply fails with the container logs when the entrypoint dies instantly", async () => {
-  const dind = fakeDind();
-  dind.onRun = () => ({
-    status: "exited",
-    exitCode: 127,
-    logs: "sh: server.js: not found",
-    listening: false,
+test("the daemon probe reports why Docker is unreachable", async () => {
+  const dockerExec: DockerExec = async () => ({
+    code: 1,
+    stdout: "",
+    stderr: "dial unix /var/run/docker.sock: connect: no such file or directory\n",
   });
-  const p = provider(dind);
-  const { d, v } = deployment("cccccccc-3333-4000-8000-000000000003");
-  await assert.rejects(p.apply(d, v), /server\.js: not found/);
-  // the dead container must not be left behind
-  assert.equal(dind.containers.size, 0);
+
+  assert.equal(
+    await dockerDaemonFailure({ dockerExec }),
+    "dial unix /var/run/docker.sock: connect: no such file or directory",
+  );
 });
 
-test("apply fails when the container runs but never listens", async () => {
-  const dind = fakeDind();
-  dind.onRun = () => ({ status: "running", exitCode: 0, logs: "booting...", listening: false });
-  const p = provider(dind);
-  const { d, v } = deployment("dddddddd-4444-4000-8000-000000000004");
-  await assert.rejects(p.apply(d, v), /did not accept connections/);
+test("the daemon probe reports a failed probe rather than throwing", async () => {
+  const dockerExec: DockerExec = async () => {
+    throw new Error("spawn docker ENOENT");
+  };
+
+  assert.equal(await dockerDaemonFailure({ dockerExec }), "spawn docker ENOENT");
 });
 
-test("apply succeeds when the container runs and listens", async () => {
-  const dind = fakeDind();
-  const p = provider(dind);
-  const { d, v } = deployment("eeeeeeee-5555-4000-8000-000000000005");
-  const endpoint = await p.apply(d, v);
-  assert.equal(endpoint.host, "127.0.0.1");
-  assert.equal(endpoint.port, 9200);
+test("the daemon probe reports the exit code when Docker is silent", async () => {
+  const dockerExec: DockerExec = async () => ({ code: 7, stdout: "", stderr: "" });
+
+  assert.equal(await dockerDaemonFailure({ dockerExec }), "exit 7");
+});
+
+test("the daemon probe reports a hung daemon as a timeout", async () => {
+  const dockerExec: DockerExec = async () => ({ code: -1, stdout: "", stderr: "" });
+
+  assert.equal(await dockerDaemonFailure({ dockerExec }), "no response within 10s");
 });

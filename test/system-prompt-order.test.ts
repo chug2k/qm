@@ -27,6 +27,7 @@ import type { ConnectorStatusCache } from "../src/credentials/connector-status.t
 import type { ConnectorTokenStore } from "../src/credentials/keychain.ts";
 import type { SkillStore } from "../src/skills/skill-store.ts";
 import { scopeId, type Conversation, type Principal } from "../src/types.ts";
+import type { ManagedGroupDirectory } from "../src/resolution/scope-membership.ts";
 
 const ORG = "default-org";
 const actor: Principal = { id: "U1", type: "internal" };
@@ -74,7 +75,14 @@ const skills = {
   visibleFor: async () => [{ skill: { manifest: { name: "deploy", description: "Deploy the app" } }, shadowed: [] }],
 } as unknown as SkillStore;
 
-function buildOrchestrator(extra: { crons?: CronStore; sandbox?: Sandbox; skills?: SkillStore } = {}) {
+function buildOrchestrator(
+  extra: {
+    crons?: CronStore;
+    sandbox?: Sandbox;
+    skills?: SkillStore;
+    managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "members" | "version" | "withVersion" | "slackChannel">;
+  } = {},
+) {
   const config = createMemoryConfigStore(ORG);
   const acl = createAclStore();
   const auditLog = createAuditLog();
@@ -183,15 +191,9 @@ test("system prompt is ordered cached-prefix → volatile tail, with memory LAST
   assert.match(prompt, /\$AGENT_API_URL/);
 });
 
-test("the cached prefix is byte-identical across two turns of one conversation (only the volatile tail changes)", async () => {
+test("the system prompt is byte-identical across two turns a minute apart; the clock rides the environment note", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { orchestrator: orch } = buildOrchestrator();
-
-  const VOLATILE_BOUNDARY = "\n\n## The user's local time";
-  const prefixOf = (prompt: string): string => {
-    const at = prompt.indexOf(VOLATILE_BOUNDARY);
-    assert.notEqual(at, -1, "the volatile tail must open with ## The user's local time");
-    return prompt.slice(0, at);
-  };
 
   const turn = (): OrchestratorInput =>
     dm("dm:U1:cache-stable", "!sysprompt", {
@@ -201,25 +203,38 @@ test("the cached prefix is byte-identical across two turns of one conversation (
         { target: "C2", label: "#random" },
       ],
     });
+  const systemOf = (reply: string): string => reply.split("\n\n<environment>")[0]!;
+  const environmentOf = (reply: string): string => reply.slice(systemOf(reply).length);
 
   const first = await orch.handleTurn(turn());
+  t.mock.timers.tick(61_000);
   const second = await orch.handleTurn(turn());
   assert.equal(first.status, "ok");
   assert.equal(second.status, "ok");
 
-  const prefixA = prefixOf(first.reply ?? "");
-  const prefixB = prefixOf(second.reply ?? "");
-
-  const hasHeading = (text: string, title: string): boolean => text.includes(`\n## ${title}\n`);
-
-  for (const title of ["This machine", "Skills", "Where you are", "Where scheduled tasks post"]) {
-    assert.ok(hasHeading(prefixA, title), `expected "## ${title}" inside the cached prefix`);
+  for (const title of [
+    "This machine",
+    "Skills",
+    "Where you are",
+    "Where scheduled tasks post",
+    "Your logins",
+    "Connected apps",
+  ]) {
+    assert.ok(systemOf(first.reply ?? "").includes(`\n## ${title}\n`), `expected "## ${title}" in the system prompt`);
   }
-  for (const title of ["Your logins", "Connected apps", "What you remember"]) {
-    assert.ok(!hasHeading(prefixA, title), `"## ${title}" must stay in the volatile tail, not the cached prefix`);
+  for (const title of ["The user's local time", "What you remember"]) {
+    assert.ok(
+      !systemOf(first.reply ?? "").includes(`\n## ${title}\n`),
+      `"## ${title}" must not be in the system prompt`,
+    );
   }
-
-  assert.equal(prefixB, prefixA, "the cached prefix must be byte-identical across two turns of one conversation");
+  assert.match(environmentOf(first.reply ?? ""), /## The user's local time/);
+  assert.notEqual(environmentOf(second.reply ?? ""), environmentOf(first.reply ?? ""), "the clock moved a minute");
+  assert.equal(
+    systemOf(second.reply ?? ""),
+    systemOf(first.reply ?? ""),
+    "the system prompt must be byte-identical across turns or every cached message block behind it is invalidated",
+  );
 });
 
 test("the cached prefix survives skill-store reordering + a recordUse-style metadata update", async () => {
@@ -231,11 +246,7 @@ test("the cached prefix survives skill-store reordering + a recordUse-style meta
   const churningSkills = { visibleFor: async () => [...visible] } as unknown as SkillStore;
   const { orchestrator: orch } = buildOrchestrator({ skills: churningSkills });
 
-  const prefixOf = (prompt: string): string => {
-    const at = prompt.indexOf("\n\n## The user's local time");
-    assert.notEqual(at, -1, "the volatile tail must open with ## The user's local time");
-    return prompt.slice(0, at);
-  };
+  const prefixOf = (prompt: string): string => prompt.split("\n\n<environment>")[0]!;
   const turn = () => dm("dm:U1:skill-order", "!sysprompt", { timezone: "America/New_York" });
 
   const first = await orch.handleTurn(turn());
@@ -307,4 +318,43 @@ test("Slack turns get the terse-response style instruction; other surfaces do no
   assert.equal(nonSlack.status, "ok");
   assert.doesNotMatch(nonSlack.reply ?? "", /## Talking on Slack/);
   assert.doesNotMatch(nonSlack.reply ?? "", /a couple of sentences/);
+});
+test("a project session names its linked Slack home channel; unlinked projects get no block", async () => {
+  const managedGroups = {
+    recognizes: (ref: string) => ref.startsWith("web-project-"),
+    membership: async () => true,
+    members: async () => [actor.id],
+    version: async () => "1",
+    withVersion: async <T>(_ref: string, _version: string | undefined, fn: () => Promise<T>) => fn(),
+    slackChannel: async (ref: string) =>
+      ref === "web-project-linked" ? { channelId: "C-ENG", channelName: "eng" } : undefined,
+  };
+  const { orchestrator: orch } = buildOrchestrator({ managedGroups });
+
+  const group = (ref: string, thread: string): OrchestratorInput => ({
+    surface: "test",
+    actor,
+    conversation: {
+      kind: "group",
+      threadRef: thread,
+      channelRef: ref,
+      channelName: "Proj",
+      audience: [actor],
+    } as Conversation,
+    text: "!sysprompt",
+    scopeVersion: "1",
+    sessionParticipantIds: [actor.id],
+    origin: { kind: "direct" },
+  });
+
+  const linked = await orch.handleTurn(group("web-project-linked", "grp:linked:1"));
+  assert.equal(linked.status, "ok", `refused: ${(linked as { reason?: string }).reason}`);
+  const prompt = linked.reply ?? "";
+  assert.match(prompt, /## Project home channel/);
+  assert.match(prompt, /#eng/);
+  assert.match(prompt, /channel: "eng"/);
+
+  const unlinked = await orch.handleTurn(group("web-project-bare", "grp:bare:1"));
+  assert.equal(unlinked.status, "ok");
+  assert.ok(!(unlinked.reply ?? "").includes("## Project home channel"));
 });

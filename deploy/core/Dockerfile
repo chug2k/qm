@@ -1,10 +1,11 @@
 FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
 
-RUN apk add --no-cache ca-certificates curl git git-daemon
+RUN apk add --no-cache ca-certificates curl git git-daemon docker-cli
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY .husky/install.mjs .husky/install.mjs
 RUN npm ci --omit=dev && npm audit --omit=dev --audit-level=moderate \
   && rm -rf /root/.npm /tmp/node-compile-cache
 

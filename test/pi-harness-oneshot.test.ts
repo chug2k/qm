@@ -27,6 +27,7 @@ import {
   transportFromModel,
 } from "../src/harness/pi-harness.ts";
 import { DEFAULT_AGENT_MODEL_ID, auxiliaryModelFor, getRequiredModel, resolveModel } from "../src/model/pi-models.ts";
+import { modelGatewayRequest } from "../src/model/provider-endpoints.ts";
 import { reconstructMessagesFromHistory } from "../src/harness/replay.ts";
 import type { SessionEntry } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -117,6 +118,12 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
       detectModelId: "model-detect",
       titleModelId: "model-title",
       anthropicApiKey: "sk-test",
+      modelGateway: {
+        url: "http://gateway.internal:8080",
+        apiKey: "gateway-key",
+        apiKeyHeader: "api-key",
+        models: { "claude-opus-5": "router/opus" },
+      },
       piCaptureRequests: false,
       piSystemCacheSplit: true,
       scratchExecEnabled: true,
@@ -136,6 +143,12 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
     detectModelId: "model-detect",
     titleModelId: "model-title",
     apiKey: "sk-test",
+    modelGateway: {
+      url: "http://gateway.internal:8080",
+      apiKey: "gateway-key",
+      apiKeyHeader: "api-key",
+      models: { "claude-opus-5": "router/opus" },
+    },
     captureRequests: false,
     systemCacheSplit: true,
     scratchExec: true,
@@ -174,15 +187,12 @@ test("piHarnessConfigOptions carries the deployment provider into Pi auxiliary m
   assert.equal(auxiliaryModelFor(opts.defaultModelId!), "gpt-5.6-luna");
 });
 
-test("Pi title generation surfaces a missing auxiliary-model credential", async () => {
+test("Pi title generation returns no title without an auxiliary-model credential", async () => {
   const harness = createPiHarness({
     defaultModelId: "gpt-5.6-sol",
     resolveProviderKeys: async () => ({}),
   });
-  await assert.rejects(
-    harness.models.generateTitle!("User:\nPrioritize the public qm issues"),
-    /missing openai credential for title model gpt-5\.6-luna/i,
-  );
+  assert.equal(await harness.models.generateTitle!("User:\nPrioritize the public qm issues"), undefined);
 });
 
 test("piHarnessConfigOptions omits the optional fields when the config leaves them unset", () => {
@@ -266,6 +276,85 @@ test("oneShot completes an authenticated Pi 0.82 turn", async (t) => {
   assert.equal(apiKey, "test-key");
   assert.match(requestBody, /system/);
   assert.match(requestBody, /hello/);
+});
+
+test("oneShot routes configured models through the model gateway without mutating transport metadata", async (t) => {
+  const requests: Array<{ gatewayKey?: string; providerKey?: string; model?: string }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += String(chunk);
+    });
+    request.on("end", () => {
+      const requestModel = (JSON.parse(body) as { model?: string }).model;
+      requests.push({
+        ...(request.headers["api-key"] ? { gatewayKey: String(request.headers["api-key"]) } : {}),
+        ...(request.headers["x-api-key"] ? { providerKey: String(request.headers["x-api-key"]) } : {}),
+        ...(requestModel ? { model: requestModel } : {}),
+      });
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_gateway",
+            type: "message",
+            role: "assistant",
+            model: requestModel,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "gateway" } },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+        { type: "message_stop" },
+      ]) {
+        response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const modelGateway = {
+    url: `http://127.0.0.1:${address.port}`,
+    apiKey: "gateway-secret",
+    apiKeyHeader: "api-key",
+    models: { "claude-haiku-4-5": "router/haiku" },
+  };
+  const model = getRequiredModel("claude-haiku-4-5");
+  assert.equal(
+    await oneShot("pi-gateway-test", model, "direct-provider-key", "system", "hello", { modelGateway }),
+    "gateway",
+  );
+  const directModel = { ...getRequiredModel("claude-opus-4-8"), baseUrl: modelGateway.url };
+  assert.equal(await oneShot("pi-direct-test", directModel, "direct-provider-key", "system", "hello"), "gateway");
+  assert.deepEqual(requests, [
+    { gatewayKey: "gateway-secret", providerKey: "gateway-secret", model: "router/haiku" },
+    { providerKey: "direct-provider-key", model: "claude-opus-4-8" },
+  ]);
+  const routed = modelGatewayRequest(modelGateway, model);
+  assert.equal(routed?.model.id, "claude-haiku-4-5");
+  assert.equal(routed?.target, "router/haiku");
+  assert.deepEqual(transportFromModel(model), { modelId: "claude-haiku-4-5" });
 });
 
 test("Pi assistant error messages fail the turn instead of becoming a blank reply", () => {
@@ -399,33 +488,21 @@ test("turn-detection prompt treats implied assistant-target follow-ups as addres
   assert.match(prompt, /<@U123> what do you mean by that\?[^]*NO/);
 });
 
-test("sanitizeLlmPayload elides thinking signatures while keeping thinking text and redacting images", () => {
-  const signature = "EsMM".repeat(2000);
-  const imageBytes = "AAAA".repeat(1000);
+test("sanitizeLlmPayload captures the prompt envelope and drops the message array", () => {
   const payload = {
     model: "claude-opus-4-8",
-    messages: [
-      {
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "Let me reason about this.", signature },
-          { type: "image", source: { type: "base64", media_type: "image/png", data: imageBytes } },
-        ],
-      },
-    ],
+    system: [{ type: "text", text: "be helpful" }],
+    tools: [{ name: "execute" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
   };
 
-  const { request, truncated } = sanitizeLlmPayload(payload);
+  const { envelope, truncated } = sanitizeLlmPayload(payload);
   assert.equal(truncated, false);
-
-  const content = (request as any).messages[0].content;
-  const [thinkingBlock, imageBlock] = content;
-
-  assert.equal(thinkingBlock.thinking, "Let me reason about this.", "thinking text is preserved");
-  assert.equal(thinkingBlock.signature, `<signature ${signature.length} chars omitted>`);
-  assert.doesNotMatch(thinkingBlock.signature, /EsMM/, "raw signature bytes are gone");
-
-  assert.match(imageBlock.source.data, /<base64 image\/png omitted: \d+ chars>/, "sibling image still redacted");
+  assert.deepEqual(envelope, {
+    model: "claude-opus-4-8",
+    system: [{ type: "text", text: "be helpful" }],
+    tools: [{ name: "execute" }],
+  });
 });
 
 const imageBlock = (data: string) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
@@ -533,16 +610,16 @@ test("sanitizeLlmPayload attaches transport from the model arg alongside the red
   assert.equal(sanitizeLlmPayload({ messages: [] }).transport, undefined);
 });
 
-test("sanitizeLlmPayload elides redacted_thinking data", () => {
-  const data = "redacted".repeat(500);
+test("sanitizeLlmPayload redacts image bytes that appear outside the message array", () => {
+  const big = "AAAA".repeat(2000);
   const payload = {
-    messages: [{ role: "assistant", content: [{ type: "redacted_thinking", data }] }],
+    system: [{ type: "image", source: { type: "base64", media_type: "image/png", data: big } }],
+    messages: [],
   };
 
-  const { request } = sanitizeLlmPayload(payload);
-  const block = (request as any).messages[0].content[0];
-  assert.equal(block.data, `<redacted_thinking ${data.length} chars omitted>`);
-  assert.doesNotMatch(block.data, /redactedredacted/, "raw redacted_thinking bytes are gone");
+  const { envelope } = sanitizeLlmPayload(payload);
+  const block = (envelope as any).system[0];
+  assert.match(block.source.data, /<base64 image\/png omitted: \d+ chars>/, "image bytes never persist");
 });
 
 test("renderDetectPrompt uses prior assistant replies, not assembled prior user prompts", () => {
@@ -643,6 +720,7 @@ test("refusalFallbackNote names both models, carries the provider's refusal, and
 });
 
 test("refusal fallback drawdown: Fable -> Opus, Opus -> Sonnet, never the refused model back", () => {
+  assert.equal(refusalFallbackModelId("claude-fable-5-1"), "claude-opus-5");
   assert.equal(refusalFallbackModelId("claude-fable-5"), "claude-opus-5");
   assert.equal(refusalFallbackModelId("claude-opus-5"), "claude-sonnet-5");
   for (const id of REFUSAL_FALLBACK_MODEL_IDS) {

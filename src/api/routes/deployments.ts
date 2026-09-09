@@ -11,14 +11,20 @@ import { spawn } from "node:child_process";
 import { basename, dirname } from "node:path";
 import { deploymentView, type App, type DeployInput } from "../app.ts";
 import { errMessage } from "../../util/errors.ts";
+import { resolveBranding } from "../../resolution/branding.ts";
 import { canonicalPayload, escapeHtml, sendJson, verifyOrReject } from "../http.ts";
-import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../auth/portal-identity.ts";
+import { mintPortalIdentity, verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../auth/portal-identity.ts";
 import { audit, authorizeAdmin, isObj, orgScope } from "./shared.ts";
 import { parseScopeId, scopeId, type Permission } from "../../types.ts";
 import type { ApiCtx, BaseCtx, Route } from "./route.ts";
 import { CONFIG_DEFAULTS } from "../../config.ts";
 import { resolveShareTarget as resolveShareTargetGrammar } from "../artifact-share.ts";
-import { mintDeployOwnerToken, verifyDeployGitAccess, verifyDeployOwnerToken } from "../../deploy/access-token.ts";
+import {
+  mintDeployOwnerToken,
+  verifyDeployGitAccess,
+  verifyDeployOwnerToken,
+  viewerIdentityKey,
+} from "../../deploy/access-token.ts";
 import { APP_SHELL_PATH_PREFIX, appShellHtml } from "../../deploy/app-shell.ts";
 import { principalDestination } from "../../reach/reach.ts";
 import { portalSessionSub } from "../../deploy/viewer-session.ts";
@@ -67,8 +73,26 @@ async function proxyDeployment(ctx: BaseCtx): Promise<void> {
       }
     }
   }
+  if (
+    deps.deployAppsDomain &&
+    deps.deployGateSecret &&
+    deps.deployAppsSessionSecret &&
+    method === "GET" &&
+    String(req.headers["sec-fetch-dest"] ?? "") === "document"
+  ) {
+    const d = await app.getDeployment(id).catch(() => null);
+    const slug = d?.name ?? d?.id;
+    if (d && slug && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
+      res.writeHead(302, {
+        location: `https://${slug}.${deps.deployAppsDomain}${subPath}${url.search}`,
+        "cache-control": "no-store",
+      });
+      res.end();
+      return;
+    }
+  }
   const reach = await app.reachDeployment(id, principal);
-  return proxyReach(ctx, reach, subPath);
+  return proxyReach(ctx, reach, subPath, principal, { sandbox: true });
 }
 
 function adminDeploymentProxyParts(pathname: string): { id: string; subPath: string } | null {
@@ -115,7 +139,7 @@ async function proxyAdminDeployment(ctx: BaseCtx): Promise<void> {
     scopeLabel: deployment.ownerScopeId,
   });
   const reach = await app.reachDeployment(parts.id, "", { bypassAcl: true });
-  return proxyReach(ctx, reach, parts.subPath);
+  return proxyReach(ctx, reach, parts.subPath, undefined, { sandbox: true });
 }
 
 const GATEWAY_AUTH_HEADERS = [
@@ -169,8 +193,11 @@ function forwardableHeaders(req: BaseCtx["req"]): Record<string, string | string
   return out;
 }
 
+const APP_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads";
+
 function gatewaySafeResponseHeaders(
   headers: Record<string, string | string[] | number | undefined>,
+  sandbox = false,
 ): Record<string, string | string[]> {
   const normalized: Record<string, string | string[] | undefined> = {};
   for (const [rawName, value] of Object.entries(headers)) {
@@ -185,6 +212,13 @@ function gatewaySafeResponseHeaders(
     const kept = values.filter((cookie) => !/^\s*(?:dpl_access|dpl_owner|portal_session)\s*=/i.test(cookie));
     if (kept.length) out["set-cookie"] = kept;
     else delete out["set-cookie"];
+  }
+  delete out["clear-site-data"];
+  if (sandbox) {
+    const existing = out["content-security-policy"];
+    out["content-security-policy"] = existing
+      ? [...(Array.isArray(existing) ? existing : [existing]), APP_SANDBOX_CSP]
+      : APP_SANDBOX_CSP;
   }
   return out;
 }
@@ -251,6 +285,7 @@ function proxyReachHttp2(
   subPath: string,
   headers: Record<string, string | string[]>,
   bufferedBody: Buffer | null,
+  sandbox: boolean,
 ): void {
   const { req, res, deps, url, method } = ctx;
   const { host, port, tls } = endpoint.endpoint;
@@ -322,7 +357,8 @@ function proxyReachHttp2(
         return start(true);
       }
       if (res.destroyed || res.writableEnded) return;
-      if (!res.headersSent) sendJson(res, 502, { error: "bad_gateway", message: "deployment unreachable" });
+      if (wantsWarmingPage(req, method) && !res.headersSent) sendWarmingPage(res);
+      else if (!res.headersSent) sendJson(res, 502, { error: "bad_gateway", message: "deployment unreachable" });
       else res.destroy();
     };
     up.once("close", () => {
@@ -330,14 +366,20 @@ function proxyReachHttp2(
       if (!responseStarted || !up.readableEnded || up.rstCode !== http2Constants.NGHTTP2_NO_ERROR) fail();
       else if (!failureHandled && !res.destroyed && !res.writableEnded) res.end();
     });
-    up.setTimeout(deps.deployDialTimeoutMs ?? CONFIG_DEFAULTS.deployDialTimeoutMs, () => {
-      if (failureHandled) return;
-      failureHandled = true;
-      if (!res.headersSent) sendJson(res, 504, { error: "gateway_timeout", message: "deployment did not respond" });
-      else res.end();
-      up.close(http2Constants.NGHTTP2_CANCEL);
-      checkDeploymentHttp2Session(connection);
-    });
+    const htmlNav = wantsWarmingPage(req, method);
+    up.setTimeout(
+      warmingDialTimeoutMs(`${host}:${port}`, htmlNav, deps.deployDialTimeoutMs ?? CONFIG_DEFAULTS.deployDialTimeoutMs),
+      () => {
+        if (failureHandled) return;
+        failureHandled = true;
+        if (htmlNav && !res.headersSent) sendWarmingPage(res);
+        else if (!res.headersSent)
+          sendJson(res, 504, { error: "gateway_timeout", message: "deployment did not respond" });
+        else res.end();
+        up.close(http2Constants.NGHTTP2_CANCEL);
+        checkDeploymentHttp2Session(connection);
+      },
+    );
     up.on("response", (responseHeaders) => {
       if (failureHandled || res.headersSent || res.destroyed || res.writableEnded) {
         up.close(http2Constants.NGHTTP2_CANCEL);
@@ -345,9 +387,10 @@ function proxyReachHttp2(
       }
       responseStarted = true;
       up.setTimeout(0);
+      markUpstreamUp(`${host}:${port}`);
       armThrottleShield(`${host}:${port}`, Number(responseHeaders[":status"] ?? 0), up);
       const status = Number(responseHeaders[":status"] ?? 502);
-      const safeHeaders = gatewaySafeResponseHeaders(responseHeaders);
+      const safeHeaders = gatewaySafeResponseHeaders(responseHeaders, sandbox);
       res.writeHead(status, safeHeaders);
       up.pipe(res, { end: false });
     });
@@ -359,10 +402,86 @@ function proxyReachHttp2(
   start(false);
 }
 
+// --- cold-start warming page -------------------------------------------------
+// AWS microVMs auto-resume on first connect, which can take many seconds. During
+// that window a browser navigation would otherwise hang for the full dial timeout
+// and then land on raw gateway JSON. For document requests we instead answer
+// quickly with a small self-refreshing "warming up" page.
+const WARM_RECENT_MS = 60_000;
+const COLD_FIRST_BYTE_TIMEOUT_MS = 4_000;
+const upstreamLastOk = new Map<string, number>();
+
+function markUpstreamUp(upstreamKey: string): void {
+  if (upstreamLastOk.size > 1000) {
+    for (const [k, at] of upstreamLastOk) if (Date.now() - at > WARM_RECENT_MS) upstreamLastOk.delete(k);
+  }
+  upstreamLastOk.set(upstreamKey, Date.now());
+}
+
+function wantsWarmingPage(req: BaseCtx["req"], method: string): boolean {
+  if (method !== "GET" && method !== "HEAD") return false;
+  const dest = String(req.headers["sec-fetch-dest"] ?? "");
+  if (dest && dest !== "document") return false;
+  return String(req.headers.accept ?? "").includes("text/html");
+}
+
+function warmingDialTimeoutMs(upstreamKey: string, htmlNav: boolean, configuredMs: number): number {
+  if (!htmlNav) return configuredMs;
+  const lastOk = upstreamLastOk.get(upstreamKey) ?? 0;
+  if (Date.now() - lastOk < WARM_RECENT_MS) return configuredMs;
+  return Math.min(configuredMs, COLD_FIRST_BYTE_TIMEOUT_MS);
+}
+
+const WARMING_PAGE_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starting up…</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fafaf8;color:#333}
+  .card{text-align:center;padding:2rem}
+  .spinner{width:28px;height:28px;margin:0 auto 1rem;border:3px solid #eee;border-top-color:#f26522;
+    border-radius:50%;animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  h1{font-size:1.1rem;font-weight:600;margin:0 0 .35rem}
+  p{margin:0;color:#777}
+</style></head>
+<body><div class="card"><div class="spinner"></div><h1>Starting up&hellip;</h1>
+<p id="msg"></p></div>
+<script>
+  var started = Date.now();
+  function retry(){
+    if (Date.now() - started > 120000) {
+      document.getElementById("msg").textContent = "Still not responding — the app may have crashed.";
+      return;
+    }
+    fetch(location.href, { method: "HEAD", cache: "no-store" }).then(function(r){
+      if (r.status !== 503 && r.status !== 502 && r.status !== 504) location.reload();
+      else setTimeout(retry, 2000);
+    }).catch(function(){ setTimeout(retry, 2000); });
+  }
+  setTimeout(retry, 1500);
+</script></body></html>`;
+
+function sendWarmingPage(res: BaseCtx["res"]): void {
+  if (res.headersSent || res.destroyed || res.writableEnded) {
+    res.end();
+    return;
+  }
+  res.writeHead(503, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "retry-after": "2",
+  });
+  res.end(WARMING_PAGE_HTML);
+}
+// -----------------------------------------------------------------------------
+
 async function proxyReach(
   ctx: BaseCtx,
   reach: Awaited<ReturnType<App["reachDeployment"]>>,
   subPath: string,
+  viewer?: string,
+  opts?: { sandbox?: boolean },
 ): Promise<void> {
   const { req, res, deps, url, method } = ctx;
   if (res.destroyed) return;
@@ -389,6 +508,13 @@ async function proxyReach(
     host: hostHeader,
     ...reach.endpoint.proxyHeaders,
   };
+
+  if (viewer && ctx.secret) {
+    headers[PORTAL_IDENTITY_HEADER] = await mintPortalIdentity(
+      { p: viewer, exp: Date.now() + 60_000 },
+      viewerIdentityKey(ctx.secret, reach.id),
+    );
+  }
   if (/(?:^|,)\s*chunked\s*$/i.test(String(req.headers["transfer-encoding"] ?? ""))) {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -408,24 +534,33 @@ async function proxyReach(
   }
   if (res.destroyed) return;
   if (reach.endpoint.httpVersion === "2") {
-    proxyReachHttp2(ctx, reach, subPath, headers, bufferedBody);
+    proxyReachHttp2(ctx, reach, subPath, headers, bufferedBody, opts?.sandbox ?? false);
     return;
   }
+  const htmlNav = wantsWarmingPage(req, method);
   const up = requestFn({ hostname: host, port, path: subPath + url.search, method, headers }, (upRes) => {
     up.setTimeout(0);
+    markUpstreamUp(upstreamKey);
     upRes.on("error", () => res.destroy());
     armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
-    const headers = gatewaySafeResponseHeaders(upRes.headers);
+    const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
     res.writeHead(upRes.statusCode ?? 502, headers);
     upRes.pipe(res);
   });
-  up.setTimeout(deps.deployDialTimeoutMs ?? CONFIG_DEFAULTS.deployDialTimeoutMs, () => {
-    if (!res.headersSent) sendJson(res, 504, { error: "gateway_timeout", message: "deployment did not respond" });
+  const dialMs = warmingDialTimeoutMs(
+    upstreamKey,
+    htmlNav,
+    deps.deployDialTimeoutMs ?? CONFIG_DEFAULTS.deployDialTimeoutMs,
+  );
+  up.setTimeout(dialMs, () => {
+    if (htmlNav && !res.headersSent) sendWarmingPage(res);
+    else if (!res.headersSent) sendJson(res, 504, { error: "gateway_timeout", message: "deployment did not respond" });
     else res.end();
     up.destroy();
   });
   up.on("error", () => {
-    if (!res.headersSent) sendJson(res, 502, { error: "bad_gateway", message: "deployment unreachable" });
+    if (htmlNav && !res.headersSent) sendWarmingPage(res);
+    else if (!res.headersSent) sendJson(res, 502, { error: "bad_gateway", message: "deployment unreachable" });
     else res.end();
   });
   req.on("error", () => up.destroy());
@@ -682,7 +817,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     // frame's own load carries sec-fetch-dest: iframe, so it proxies straight through.
     const isTopDocument = String(req.headers["sec-fetch-dest"] ?? "") === "document";
     if (ctx.method === "GET" && isTopDocument && deps.deployAppsLoginUrl) {
-      const accent = deps.config ? (await deps.config.getBrandingDurable(orgScope(deps)))?.accent : undefined;
+      const accent = (await resolveBranding(deps.config, orgScope(deps), deps.brandingDefault)).accent;
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       res.end(
         appShellHtml({
@@ -695,7 +830,10 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
       return true;
     }
     const reach = await app.reachDeployment(slug, "", { bypassAcl: true });
-    await proxyReach(ctx, reach, pathname);
+    const sub = deps.deployAppsSessionSecret
+      ? portalSessionSub(req.headers.cookie, deps.deployAppsSessionSecret)
+      : null;
+    await proxyReach(ctx, reach, pathname, sub ?? undefined);
     return true;
   }
   const sessionSecret = deps.deployAppsSessionSecret;
@@ -779,7 +917,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     cleanUrlRedirect();
     return true;
   }
-  await proxyReach(ctx, reach, pathname);
+  await proxyReach(ctx, reach, pathname, sub);
   return true;
 }
 
@@ -1030,10 +1168,15 @@ async function serveDeploymentGit(ctx: BaseCtx): Promise<void> {
 }
 
 function gitUrlBase(ctx: ApiCtx): string {
-  if (ctx.deps.publicUrl) return ctx.deps.publicUrl;
-  const host = (ctx.req.headers["x-forwarded-host"] as string) ?? ctx.req.headers.host ?? "localhost";
-  const proto = (ctx.req.headers["x-forwarded-proto"] as string) ?? "http";
-  return `${proto}://${host}`;
+  if (ctx.deps.apiBaseUrl) {
+    return ctx.deps.apiBaseUrl;
+  } else if (ctx.deps.publicUrl) {
+    return ctx.deps.publicUrl;
+  } else {
+    const host = (ctx.req.headers["x-forwarded-host"] as string) ?? ctx.req.headers.host ?? "localhost";
+    const proto = (ctx.req.headers["x-forwarded-proto"] as string) ?? "http";
+    return `${proto}://${host}`;
+  }
 }
 
 async function deploymentGitUrl(ctx: ApiCtx): Promise<void> {
@@ -1057,11 +1200,14 @@ async function deploymentOwnerUrl(ctx: ApiCtx): Promise<void> {
   if (!sub) return sendJson(res, 403, { error: "forbidden", message: "an identified caller is required" });
   const gateSecret = deps.deployGateSecret;
   const appsDomain = deps.deployAppsDomain;
-  if (!gateSecret || !appsDomain)
-    return sendJson(res, 503, { error: "unavailable", message: "deployment subdomains are not configured" });
   const deployment = await app.getDeployment(params.id!);
   if (!deployment) return sendJson(res, 404, { error: "not_found" });
   const slug = deployment.name ?? deployment.id;
+  if (!gateSecret || !appsDomain)
+    return sendJson(res, 503, {
+      error: "unavailable",
+      message: `app subdomains are not configured — this app is reachable signed-in at /d/${slug}/; set DEPLOY_APPS_DOMAIN (with AWS_DEPLOY_GATE_SECRET) to enable per-app subdomains and live editing`,
+    });
   if (!(await app.canManageDeployment(deployment.id, sub, ctx.capability?.scopeId)))
     return sendJson(res, 403, { error: "forbidden", message: "only someone who manages this app can edit it live" });
   const exp = Date.now() + OWNER_LINK_TTL_MS;
@@ -1103,6 +1249,27 @@ function textContentType(contentType: string): boolean {
     /(?:^|\/)(?:json|xml|javascript)(?:;|$)/i.test(contentType) ||
     /\+(?:json|xml)(?:;|$)/i.test(contentType)
   );
+}
+
+const LOGS_DEFAULT_TAIL_LINES = 200;
+const LOGS_MAX_TAIL_LINES = 2000;
+
+async function deploymentLogs(ctx: ApiCtx): Promise<void> {
+  const { res, app, params, capability, actor, url } = ctx;
+  const viewer = capability?.actorId ?? actor?.p;
+  if (!viewer) return sendJson(res, 401, { error: "capability_required" });
+  const rawTail = url.searchParams.get("tailLines");
+  const tailLines = rawTail === null ? LOGS_DEFAULT_TAIL_LINES : Number(rawTail);
+  if (!Number.isInteger(tailLines) || tailLines < 1 || tailLines > LOGS_MAX_TAIL_LINES) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message: `tailLines must be an integer from 1 to ${LOGS_MAX_TAIL_LINES}`,
+    });
+  }
+  const result = await app.deploymentLogsFor(params.id!, viewer, { tailLines });
+  if (result.status !== "ok") return sendJson(res, 404, { error: "not_found" });
+  if (result.logs === null) return sendJson(res, 200, { logs: null, message: "no logs available for this deployment" });
+  return sendJson(res, 200, { logs: result.logs });
 }
 
 async function fetchDeployment(ctx: ApiCtx): Promise<void> {
@@ -1264,6 +1431,22 @@ export async function setDeploymentDisplayName(ctx: ApiCtx): Promise<void> {
   }
 }
 
+async function setDeploymentAlwaysOn(ctx: ApiCtx): Promise<void> {
+  const { res, app, params, body } = ctx;
+  const id = await deploymentId(app, params.id!);
+  if (!id) return sendJson(res, 404, { error: "not_found" });
+  if (!(await callerMayManageDeployment(ctx, id)))
+    return sendJson(res, 403, { error: "forbidden", message: "only someone who manages this app can change this" });
+  const b = body as { alwaysOn?: unknown };
+  if (typeof b.alwaysOn !== "boolean")
+    return sendJson(res, 400, { error: "bad_request", message: "alwaysOn (boolean) required" });
+  try {
+    return sendJson(res, 200, { deployment: deploymentView(await app.setDeploymentAlwaysOn(id, b.alwaysOn)) });
+  } catch (e) {
+    return sendJson(res, 400, { error: "always_on_failed", message: errMessage(e) });
+  }
+}
+
 type ShareTarget =
   | { kind: "ok"; scope: string; label: string }
   | { kind: "none" }
@@ -1348,6 +1531,7 @@ export const deploymentRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/deployments", auth: "either", handle: listDeployments },
   { method: "GET", path: "/v1/deployments/:id", auth: "either", handle: getDeployment },
   { method: "GET", path: "/v1/deployments/:id/fetch", auth: "either", handle: fetchDeployment },
+  { method: "GET", path: "/v1/deployments/:id/logs", auth: "either", handle: deploymentLogs },
   { method: "GET", path: "/v1/deployments/:id/git-url", auth: "either", handle: deploymentGitUrl },
   { method: "GET", path: "/v1/deployments/:id/owner-url", auth: "source", handle: deploymentOwnerUrl },
   { method: "POST", path: "/v1/deployments/:id/share", auth: "either", handle: shareDeployment },
@@ -1357,4 +1541,5 @@ export const deploymentRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "POST", path: "/v1/deployments/:id/restore", auth: "either", handle: restoreDeployment },
   { method: "POST", path: "/v1/deployments/:id/name", auth: "either", handle: renameDeployment },
   { method: "POST", path: "/v1/deployments/:id/display-name", auth: "either", handle: setDeploymentDisplayName },
+  { method: "POST", path: "/v1/deployments/:id/always-on", auth: "either", handle: setDeploymentAlwaysOn },
 ];

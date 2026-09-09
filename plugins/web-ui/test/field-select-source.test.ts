@@ -14,6 +14,8 @@ test("the shell has exactly one dropdown, and it is a real select", () => {
   assert.deepEqual(offenders, ["ui.ts"], "every dropdown goes through fieldSelect()");
   assert.match(ui, /<select/);
   assert.match(ui, /icon\(ChevronDown, 16\)/);
+  assert.doesNotMatch(ui, /function selectMenu/);
+  assert.doesNotMatch(readFileSync(new URL("sessions.ts", srcDir), "utf8"), /selectMenu/);
 });
 
 test("the dropdown keeps the accessible name, focus key and disabled state its callers pass", () => {
@@ -40,4 +42,16 @@ test("no page keeps its own select chrome now that one rule owns it", () => {
     assert.ok(!css.includes(dead) || dead.includes("align-self"), `${dead} should be gone`);
   assert.doesNotMatch(css, /\.list-select select \{/);
   assert.doesNotMatch(css, /\.deploy-sort select \{/);
+});
+
+test("list dropdowns share enough width to show their selected value", () => {
+  assert.match(css, /\.list-select \.field-select \{\s*min-width: 124px;/);
+});
+
+test("the dropdown holds the caller's value against re-renders (live) and stale DOM state", () => {
+  // .value on a <select> commits before its <option> children exist on first render,
+  // and lit's default dirty-check skips re-asserting it when the DOM has drifted —
+  // so the caller's value must go through live(), and options mark their own selected.
+  assert.match(ui, /import \{ live \} from "lit\/directives\/live\.js"/);
+  assert.match(ui, /\.value=\$\{props\.value === undefined \? nothing : live\(props\.value\)\}/);
 });

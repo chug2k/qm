@@ -13,7 +13,13 @@ test("scope-default buttons render when any runtime setting differs from the sco
 });
 
 test("composer-right keeps its control order: make default, use org default, model, harness, send", () => {
-  const right = composer.slice(composer.indexOf('class="composer-right"'));
+  const runtime = composer.slice(
+    composer.indexOf("const runtimeControls ="),
+    composer.indexOf("return html`", composer.indexOf("const runtimeControls =")),
+  );
+  const rendered = composer.slice(composer.indexOf('class="composer-right"'));
+  assert.match(rendered, /showRuntimeControls \? runtimeControls : nothing/);
+  const right = runtime + rendered;
   const makeDefault = right.indexOf("Make default");
   const orgDefault = right.indexOf("Use org default");
   const model = right.indexOf('kind: "model"');
@@ -54,14 +60,17 @@ test("attaching files is allowed while a turn is streaming", () => {
   assert.ok(guards.length > 0, "streaming still gates steer/send routing");
 });
 
-test("steering with pending attachments explains they ride the next message", () => {
-  assert.match(composer, /attachments stay for your next message/);
+test("a mid-turn submit queues — attachments cannot ride a queued message and stay for the next", () => {
+  // Mid-turn Enter queues through core (queueDraft), so the steer-button attachment note is gone;
+  // the queue button gates only on draft text, never on the run slot.
+  assert.match(composer, /\$\{tip\("Queue for after this turn"\)\}/);
+  assert.doesNotMatch(composer, /attachments stay for your next message/);
 });
 
 test("a steer whose run already ended is recovered, never silently dropped", () => {
-  // sendSteer must inspect the signal outcome and route a failed steer through recovery.
-  assert.match(composer, /const outcome = await ctx\.chat\.signalLiveRun\("steer", text\);/);
-  assert.match(composer, /if \(!outcome\.ok\) recoverEndedRunSteer\(agent, text, outcome\);/);
+  // steerQueued must inspect the signal outcome and route a failed steer through recovery.
+  assert.match(composer, /const outcome = await ctx\.chat\.signalLiveRun\("steer", queued\.text\);/);
+  assert.match(composer, /if \(!outcome\.ok\) recoverEndedRunSteer\(agent, queued\.text, outcome\);/);
   // Replayed by core → detach from the stale stream and attach to the fresh run.
   assert.match(composer, /function recoverEndedRunSteer\(/);
   assert.match(composer, /attachWhenIdle\(agent, 0\);/);

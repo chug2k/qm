@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
 import { createLocalJWKSet, decodeProtectedHeader, jwtVerify, type JWK } from "jose";
 import {
   authorizeQuery,
@@ -131,6 +132,49 @@ test("the whole authorization-code flow the portal drives succeeds", async (t) =
   assert.equal(userinfo.sub, claims.sub, "userinfo sub must equal the id_token sub — the portal rejects a mismatch");
   assert.equal(userinfo.email, "admin@example.com");
   assert.equal(userinfo.email_verified, true);
+});
+
+test("without email delivery, sign-in pages explain the configuration instead of claiming to send a link", async (t) => {
+  const h = await startHarness({ env: { RESEND_API_KEY: undefined } });
+  t.after(() => h.close());
+
+  const page = await fetch(`${h.base}/authorize?${authorizeQuery()}`);
+  const submitted = await fetch(`${h.base}/authorize`, form({ email: "admin@example.com" }));
+  for (const response of [page, submitted]) {
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const html = await response.text();
+    assert.match(html, /Email delivery isn&#39;t configured/);
+    assert.doesNotMatch(html, /<form|Check your email|link is on its way/);
+  }
+  await h.settle();
+  assert.deepEqual(h.mailer.sent, []);
+  assert.deepEqual(h.claims.calls, []);
+  assert.equal((await fetch(`${h.base}/healthz`)).status, 200);
+});
+
+test("removing email delivery does not invalidate already issued sign-in links", async (t) => {
+  const configured = await startHarness();
+  t.after(() => configured.close());
+  const { verifier } = await requestLink(configured);
+  const link = linkFrom(configured.mailer);
+  const h = await startHarness({
+    env: { AUTH_EMAIL_FROM: undefined, RESEND_API_KEY: undefined },
+    claims: configured.claims,
+  });
+  t.after(() => h.close());
+
+  const verified = await openLink(h, link);
+  assert.equal(verified.status, 302);
+  const code = new URL(verified.headers.get("location")!).searchParams.get("code")!;
+  const exchanged = await exchange(h, code, verifier);
+  assert.equal(exchanged.status, 200);
+  const tokens = (await exchanged.json()) as { id_token: string; access_token: string };
+  const claims = await verifyIdTokenLikePortal(h, tokens.id_token, "nonce-value");
+  assert.equal(claims.email, "admin@example.com");
+  const info = await fetch(`${h.base}/userinfo`, { headers: { authorization: `Bearer ${tokens.access_token}` } });
+  assert.equal(info.status, 200);
+  assert.equal((await openLink(h, link)).status, 400);
 });
 
 test("a replayed magic link is refused", async (t) => {
@@ -306,6 +350,46 @@ test("an address outside the allowlist is never emailed and never redeemed", asy
   assert.notEqual(refused.status, 302, "a link minted for an address that is no longer allowed must not redeem");
 });
 
+test("an invited external address signs in through core's answer and an uninvited one does not", async (t) => {
+  const invited = new Set(["guest@partner.test"]);
+  const asked: string[] = [];
+  const h = await startHarness({
+    emailAllowed: async (email) => {
+      asked.push(email);
+      return invited.has(email);
+    },
+  });
+  t.after(() => h.close());
+
+  await requestLink(h, { email: "admin@example.com" });
+  assert.deepEqual(asked, [], "an address on the env allow-list never consults core");
+
+  const { verifier } = await requestLink(h, { email: "guest@partner.test" });
+  assert.equal(h.mailer.sent.length, 2);
+  assert.equal(h.mailer.sent[1]!.to, "guest@partner.test");
+  assert.deepEqual(asked, ["guest@partner.test"]);
+  const code = new URL(await redeem(h)).searchParams.get("code")!;
+  const tokens = await exchange(h, code, verifier);
+  assert.equal(tokens.status, 200);
+  const claims = await verifyIdTokenLikePortal(
+    h,
+    ((await tokens.json()) as { id_token: string }).id_token,
+    "nonce-value",
+  );
+  assert.equal(claims.email, "guest@partner.test");
+
+  await requestLink(h, { email: "stranger@partner.test" });
+  assert.equal(h.mailer.sent.length, 2, "an address core does not know must not receive a link");
+
+  await requestLink(h, { email: "guest@partner.test" });
+  invited.clear();
+  const revoked = await fetch(`${h.base}/verify`, {
+    ...form({ token: tokenOf(linkFrom(h.mailer)) }),
+    redirect: "manual",
+  });
+  assert.equal(revoked.status, 403, "a link minted before the invitation was revoked must not redeem");
+});
+
 test("the confirmation page is identical for permitted and unknown addresses", async (t) => {
   const h = await startHarness();
   t.after(() => h.close());
@@ -380,6 +464,32 @@ test("the broker fails closed when core cannot record a single-use claim", async
   t.after(() => failing.close());
   const response = await openLink(failing, link);
   assert.notEqual(response.status, 302, "an unrecordable link claim must not mint a code");
+});
+
+test("a core outage reads as an outage, never as a rate limit or a stale link", async (t) => {
+  const unavailable = {
+    calls: [] as string[][],
+    async claimFirst(): Promise<string | null> {
+      throw new ClaimStoreUnavailableError("core claim store unreachable: fetch failed");
+    },
+  };
+  const h = await startHarness({ claims: unavailable });
+  t.after(() => h.close());
+  await requestLink(h);
+  assert.equal(h.mailer.sent.length, 0, "sign-in fails closed while core is down");
+
+  const healthy = await startHarness();
+  t.after(() => healthy.close());
+  await requestLink(healthy);
+  const link = linkFrom(healthy.mailer);
+  const downMidVerify = await startHarness({
+    claims: unavailable,
+    env: { AUTH_SIGNING_JWK: healthy.cfg.signingJwk ? JSON.stringify(healthy.cfg.signingJwk) : undefined },
+  });
+  t.after(() => downMidVerify.close());
+  const response = await openLink(downMidVerify, link);
+  assert.equal(response.status, 503, "an outage is a retryable 503, not the dead-end stale-link page");
+  assert.match(await response.text(), /temporarily unavailable/i);
 });
 
 test("the sign-in link is single-use across broker instances that share the claim store", async (t) => {
@@ -507,4 +617,25 @@ test("the per-mailbox send limit holds when the client address changes", async (
     await requestLink(h, { clientIp });
   }
   assert.equal(h.mailer.sent.length, 2, "rotating the source address must not reset a per-mailbox budget");
+});
+
+test("a live brandName accessor overrides the env default on pages and emails", async (t) => {
+  let live = "";
+  const h = await startHarness({ brandName: () => live || "qm" });
+  t.after(() => h.close());
+
+  const { challenge } = pkcePair();
+  const query = authorizeQuery({ code_challenge: challenge });
+  const before = await (await fetch(`${h.base}/authorize?${query}`)).text();
+  assert.match(before, /Sign in to qm/);
+
+  live = "straylight";
+  const after = await (
+    await fetch(`${h.base}/authorize?${authorizeQuery({ code_challenge: pkcePair().challenge })}`)
+  ).text();
+  assert.match(after, /Sign in to straylight/);
+  assert.doesNotMatch(after, /Sign in to qm/);
+
+  await requestLink(h);
+  assert.match(h.mailer.sent[0]!.subject, /straylight/);
 });

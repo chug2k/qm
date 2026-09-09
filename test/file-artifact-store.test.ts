@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -71,6 +71,21 @@ test("DurableByteStore (local-fs) round-trips binary intact across a fresh store
     assert.deepEqual(back, PNG);
     const again = await w.put(PNG);
     assert.equal(again.blobKey, blobKey);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("DurableByteStore (local-fs) accepts concurrent identical writes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "docstore-"));
+  try {
+    const bytes = createLocalDurableByteStore(dir);
+    const big = Buffer.concat([PNG, Buffer.alloc(4 * 1024 * 1024, 7)]);
+    const results = await Promise.all(Array.from({ length: 8 }, () => bytes.put(big)));
+    for (const r of results) assert.equal(r.blobKey, results[0]!.blobKey);
+    assert.deepEqual(await drain(bytes as never, results[0]!.blobKey), big);
+    const leftovers = (await readdir(join(dir, "files"))).filter((name) => name.endsWith(".part"));
+    assert.deepEqual(leftovers, [], "no orphaned partial files survive the race");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -147,6 +162,21 @@ test("listOwnedByScopes: recency DESC, scope-filtered, keyset-paginated", async 
     ["a"],
   );
   assert.equal(p2.nextCursor, undefined, "last page has no cursor");
+});
+
+test("listOwnedByScopes: nameQuery matches names case-insensitively across the whole set", async () => {
+  const store = createMemoryFileArtifactStore(createMemoryDurableByteStore());
+  await store.put(put({ id: "a", name: "Quarterly Report.pdf", path: "p/a", data: Buffer.from("a"), createdAt: 100 }));
+  await store.put(put({ id: "b", name: "notes.txt", path: "p/b", data: Buffer.from("b"), createdAt: 200 }));
+  await store.put(put({ id: "c", name: "report-draft.txt", path: "p/c", data: Buffer.from("c"), createdAt: 300 }));
+
+  const hit = await store.listOwnedByScopes([owner], { nameQuery: "REPORT" });
+  assert.deepEqual(
+    hit.files.map((f) => f.id),
+    ["c", "a"],
+    "matches by name regardless of case, newest first",
+  );
+  assert.equal((await store.listOwnedByScopes([owner], { nameQuery: "missing" })).files.length, 0);
 });
 
 test("resolveByOwnerPaths returns the SHARED set by (owner, path); disabled excluded", async () => {

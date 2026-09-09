@@ -2,31 +2,63 @@ import { randomUUID } from "node:crypto";
 import type { Session, SessionEntry, ScopeId } from "../types.ts";
 import type {
   AttributedTurn,
+  EntrySearchHit,
   CronGroupSummary,
   GetEntriesOptions,
   GetTapeOptions,
   LeaseAttempt,
   LeaseHolder,
+  LeasePeek,
   LlmRequestRecord,
   NewEntry,
   NewLlmRequest,
+  NewSearchEntry,
   NewTapeRecord,
+  NewSessionPin,
   ParticipantWindow,
+  ScopeSessionRollup,
   ScopeSessionStats,
   SessionPage,
   SessionStore,
   SessionSummary,
+  SessionPin,
   StoreOptions,
   TapeRecord,
 } from "./session-store.ts";
 import {
+  entrySearchAuthor,
+  entrySearchText,
+  matchesSearchTerms,
+  SEARCHABLE_ENTRY_TYPES,
+  searchTerms,
+} from "./entry-search.ts";
+import {
+  contextWindowFromEntries,
   cronIdOf,
+  entryWithinTenure,
   isOverheardEntry,
+  promptEnvelopeBody,
   sessionBucket,
   sessionCategory,
   sessionOrigin,
   userMessagePreview,
 } from "./session-store.ts";
+import { SECURITY_SCREEN_STEP, screenPayloadFromEnvelope } from "../security/security-posture.ts";
+
+function toParticipantWindow(
+  sessionId: string,
+  principalId: string,
+  w: Pick<ParticipantWindow, "validFrom" | "validTo" | "validFromSeq" | "validToSeq">,
+): ParticipantWindow {
+  return {
+    sessionId,
+    principalId,
+    validFrom: w.validFrom,
+    validTo: w.validTo,
+    validFromSeq: w.validFromSeq,
+    validToSeq: w.validToSeq,
+  };
+}
 
 function idDesc(a: string, b: string): number {
   if (a < b) return 1;
@@ -40,9 +72,14 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
   const sessions = new Map<string, Session>();
   const entries = new Map<string, SessionEntry[]>();
   const tape = new Map<string, TapeRecord[]>();
+  const searchIndex = new Map<string, NewSearchEntry[]>();
   const llmRequests = new Map<string, LlmRequestRecord[]>();
+  const llmRequestSeq = new Map<string, number>();
+  let llmRequestCount = 0;
+  const promptEnvelopes = new Map<string, string>();
   const byThread = new Map<string, string>();
   const participants = new Map<string, Set<string>>();
+  const pins = new Map<string, SessionPin[]>();
   const windows = new Map<
     string,
     Map<
@@ -61,7 +98,27 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
   >();
   const leases = new Map<string, { token: string; expiresAt: number; acquiredAt: number; holder?: LeaseHolder }>();
 
+  const participantSession = (sessionId: string, principalId: string): Session | null => {
+    const s = sessions.get(sessionId);
+    if (!s) return null;
+    const view = windows.get(sessionId)?.get(principalId);
+    const all = entries.get(sessionId) ?? [];
+    const log = all.filter((e) => e.type === "user");
+    const lastActivityAt = log.length ? Math.max(s.createdAt, ...log.map((e) => e.createdAt)) : s.createdAt;
+    const visible = view ? all.some((e) => entryWithinTenure(e, view)) : false;
+    return {
+      ...s,
+      ...(view?.title != null ? { title: view.title } : {}),
+      ...(view?.archived ? { archived: true } : {}),
+      ...(view?.pinned ? { pinned: true } : {}),
+      ...(view?.color != null ? { color: view.color } : {}),
+      lastActivityAt,
+      hasEntries: visible,
+    };
+  };
+
   return {
+    leaseTtlMs,
     async getOrCreateByThread(threadRef, type, scopeId, channelName, surface) {
       const existingId = byThread.get(threadRef);
       if (existingId) {
@@ -77,7 +134,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
         type,
         scopeId,
         threadRef,
-        createdAt: Date.now(),
+        createdAt: now(),
         ...(channelName ? { channelName } : {}),
         ...(surface ? { surface } : {}),
       };
@@ -107,6 +164,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
     },
 
     async acquireLease(sessionId, holder): Promise<LeaseAttempt> {
+      if (!sessions.has(sessionId)) return { lease: null };
       const held = leases.get(sessionId);
       if (held && now() < held.expiresAt)
         return {
@@ -125,6 +183,19 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       return { lease: { sessionId, token } };
     },
 
+    async peekLease(sessionId): Promise<LeasePeek | null> {
+      const held = leases.get(sessionId);
+      if (!held) return null;
+      return { ...(held.holder ? { holder: held.holder } : {}), heldUntil: held.expiresAt };
+    },
+
+    async renewLease(lease) {
+      const held = leases.get(lease.sessionId);
+      if (!held || held.token !== lease.token || now() >= held.expiresAt) return false;
+      held.expiresAt = now() + leaseTtlMs;
+      return true;
+    },
+
     async releaseLease(lease) {
       if (leases.get(lease.sessionId)?.token === lease.token) leases.delete(lease.sessionId);
     },
@@ -138,9 +209,20 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       sessions.delete(sessionId);
       entries.delete(sessionId);
       tape.delete(sessionId);
+      searchIndex.delete(sessionId);
       llmRequests.delete(sessionId);
       windows.delete(sessionId);
       leases.delete(sessionId);
+      pins.delete(sessionId);
+    },
+
+    async deleteSessionIfEmpty(sessionId) {
+      if (!sessions.has(sessionId)) return false;
+      if ((entries.get(sessionId)?.length ?? 0) > 0) return false;
+      const held = leases.get(sessionId);
+      if (held && now() < held.expiresAt) return false;
+      await this.deleteSession(sessionId);
+      return true;
     },
 
     async forceReleaseLease(sessionId) {
@@ -149,7 +231,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
 
     async append(lease, entry: NewEntry): Promise<SessionEntry> {
       const held = leases.get(lease.sessionId);
-      if (!held || held.token !== lease.token) {
+      if (!held || held.token !== lease.token || now() >= held.expiresAt) {
         throw new Error("append without a valid session lease");
       }
       held.expiresAt = now() + leaseTtlMs;
@@ -166,6 +248,13 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
         createdAt: now(),
       };
       log.push(full);
+      const text = SEARCHABLE_ENTRY_TYPES.has(full.type) ? entrySearchText(full.payload) : null;
+      if (text?.trim()) {
+        const index = searchIndex.get(full.sessionId) ?? [];
+        const author = entrySearchAuthor(full);
+        index.push({ seq: full.seq, type: full.type, text, createdAt: full.createdAt, ...(author ? { author } : {}) });
+        searchIndex.set(full.sessionId, index);
+      }
       return full;
     },
 
@@ -176,9 +265,34 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       return opts?.limit !== undefined ? filtered.slice(-opts.limit) : filtered;
     },
 
+    async getContextWindow(sessionId) {
+      return contextWindowFromEntries(entries.get(sessionId) ?? []);
+    },
+
+    async getEntry(sessionId, seq) {
+      return (entries.get(sessionId) ?? []).find((e) => e.seq === seq);
+    },
+
+    async latestEntrySeq(sessionId) {
+      return (entries.get(sessionId)?.length ?? 0) - 1;
+    },
+
+    async clearSecurityTaint(sessionId) {
+      const log = entries.get(sessionId);
+      if (!log) return false;
+      for (const entry of log) {
+        if (!entry.payload || typeof entry.payload !== "object") continue;
+        const payload = { ...(entry.payload as Record<string, unknown>) };
+        delete payload.securityTainted;
+        entry.payload = payload;
+      }
+      return true;
+    },
+
     async appendTape(lease, rec: NewTapeRecord): Promise<TapeRecord> {
       const held = leases.get(lease.sessionId);
-      if (!held || held.token !== lease.token) throw new Error("tape append without a valid session lease");
+      if (!held || held.token !== lease.token || now() >= held.expiresAt)
+        throw new Error("tape append without a valid session lease");
       held.expiresAt = now() + leaseTtlMs;
       const log = tape.get(lease.sessionId) ?? [];
       tape.set(lease.sessionId, log);
@@ -212,6 +326,8 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
     },
 
     async recordLlmRequest(sessionId, rec: NewLlmRequest) {
+      const envelope = promptEnvelopeBody(rec.promptEnvelope);
+      if (envelope && !promptEnvelopes.has(envelope.hash)) promptEnvelopes.set(envelope.hash, envelope.body);
       const full: LlmRequestRecord = {
         id: randomUUID(),
         sessionId,
@@ -220,7 +336,8 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
         model: rec.model,
         scopeLabel: rec.scopeLabel as ScopeId,
         createdAt: now(),
-        request: rec.request,
+        request: null,
+        promptHash: envelope?.hash ?? null,
         truncated: rec.truncated ?? false,
         ttftMs: rec.ttftMs ?? null,
         durationMs: rec.durationMs ?? null,
@@ -236,7 +353,8 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
         llmRequests.set(sessionId, arr);
       }
       arr.push(full);
-      return full;
+      llmRequestSeq.set(full.id, ++llmRequestCount);
+      return rec.promptEnvelope !== undefined ? { ...full, promptEnvelope: rec.promptEnvelope } : full;
     },
 
     async listLlmRequests(sessionId, opts) {
@@ -249,7 +367,36 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
                 (want != null && r.turnSeq !== null && want.has(r.turnSeq)) || (!!opts?.orphans && r.turnSeq === null),
             )
           : all;
-      return filtered.map((r) => (opts?.omitRequest ? { ...r, request: null } : { ...r }));
+      return filtered.map((r) => {
+        if (opts?.omitRequest) return { ...r, request: null };
+        const body = r.promptHash != null ? promptEnvelopes.get(r.promptHash) : undefined;
+        return body !== undefined ? { ...r, promptEnvelope: JSON.parse(body) } : { ...r };
+      });
+    },
+
+    async listScreenSamples(limit) {
+      const wanted = Math.max(0, Math.trunc(limit));
+      if (!wanted) return [];
+      const samples = [...llmRequests.values()].flat().flatMap((r) => {
+        if (r.step !== SECURITY_SCREEN_STEP || r.promptHash == null) return [];
+        const body = promptEnvelopes.get(r.promptHash);
+        const payload = body === undefined ? null : screenPayloadFromEnvelope(JSON.parse(body));
+        return payload
+          ? [
+              {
+                id: r.id,
+                sessionId: r.sessionId,
+                scopeLabel: r.scopeLabel,
+                createdAt: r.createdAt,
+                model: r.model,
+                payload,
+              },
+            ]
+          : [];
+      });
+      return samples
+        .sort((a, b) => b.createdAt - a.createdAt || (llmRequestSeq.get(b.id) ?? 0) - (llmRequestSeq.get(a.id) ?? 0))
+        .slice(0, wanted);
     },
 
     async addParticipant(sessionId, principalId, title, opts) {
@@ -300,26 +447,15 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       if (!ids) return [];
       const out: Session[] = [];
       for (const id of ids) {
-        const s = sessions.get(id);
-        if (!s) continue;
-        const view = windows.get(id)?.get(principalId);
-        const all = entries.get(id) ?? [];
-        const log = all.filter((e) => e.type === "user");
-        const lastActivityAt = log.length ? Math.max(s.createdAt, ...log.map((e) => e.createdAt)) : s.createdAt;
-        const visible = view
-          ? all.some((e) => e.seq >= view.validFromSeq && (view.validToSeq === null || e.seq < view.validToSeq))
-          : false;
-        out.push({
-          ...s,
-          ...(view?.title != null ? { title: view.title } : {}),
-          ...(view?.archived ? { archived: true } : {}),
-          ...(view?.pinned ? { pinned: true } : {}),
-          ...(view?.color != null ? { color: view.color } : {}),
-          lastActivityAt,
-          hasEntries: visible,
-        });
+        const row = participantSession(id, principalId);
+        if (row) out.push(row);
       }
       return out;
+    },
+
+    async getForParticipant(sessionId, principalId) {
+      if (!participants.get(principalId)?.has(sessionId)) return null;
+      return participantSession(sessionId, principalId);
     },
 
     async updateParticipantView(sessionId, principalId, patch) {
@@ -331,15 +467,125 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       if (patch.color !== undefined) view.color = patch.color;
     },
 
+    async addPin(sessionId, pin: NewSessionPin, maxPins?: number): Promise<SessionPin | null> {
+      if (!sessions.has(sessionId)) return null;
+      const list = pins.get(sessionId) ?? [];
+      if (maxPins !== undefined && list.length >= maxPins) return null;
+      const rec: SessionPin = { ...pin, id: randomUUID(), sessionId, createdAt: now() };
+      list.push(rec);
+      pins.set(sessionId, list);
+      return { ...rec };
+    },
+
+    async listPins(sessionId): Promise<SessionPin[]> {
+      return (pins.get(sessionId) ?? []).map((p) => ({ ...p }));
+    },
+
+    async removePin(sessionId, pinId): Promise<boolean> {
+      const list = pins.get(sessionId);
+      if (!list) return false;
+      const next = list.filter((p) => p.id !== pinId);
+      if (next.length === list.length) return false;
+      pins.set(sessionId, next);
+      return true;
+    },
+
     async visibleEntries(sessionId, principalId) {
       const win = windows.get(sessionId)?.get(principalId);
       if (!win) return [];
       const log = entries.get(sessionId) ?? [];
-      return log.filter((e) => e.seq >= win.validFromSeq && (win.validToSeq === null || e.seq < win.validToSeq));
+      return log.filter((e) => entryWithinTenure(e, win));
     },
 
-    async listAll() {
+    async searchEntries(principalId, query, limit = 40): Promise<EntrySearchHit[]> {
+      const terms = searchTerms(query);
+      if (!terms.length) return [];
+      const hits: EntrySearchHit[] = [];
+      for (const sessionId of participants.get(principalId) ?? []) {
+        const win = windows.get(sessionId)?.get(principalId);
+        if (!win) continue;
+        const indexed = searchIndex.get(sessionId) ?? [];
+        const session = sessions.get(sessionId);
+        if (!session) continue;
+        for (const row of indexed) {
+          if (!entryWithinTenure(row, win)) continue;
+          if (!matchesSearchTerms(row.text, terms)) continue;
+          hits.push({
+            sessionId,
+            scopeId: session.scopeId,
+            ...((win.title ?? session.title) != null ? { title: win.title ?? session.title } : {}),
+            ...(session.channelName ? { channelName: session.channelName } : {}),
+            ...(session.surface ? { surface: session.surface } : {}),
+            ...(win.archived ? { archived: true } : {}),
+            seq: row.seq,
+            type: row.type,
+            ...(row.author ? { author: row.author } : {}),
+            text: row.text,
+            createdAt: row.createdAt,
+          });
+        }
+      }
+      hits.sort((a, b) => b.createdAt - a.createdAt || idDesc(a.sessionId, b.sessionId) || b.seq - a.seq);
+      return hits.slice(0, Math.max(1, Math.min(limit, 200)));
+    },
+
+    async appendSearchEntries(lease, rows): Promise<void> {
+      const held = leases.get(lease.sessionId);
+      if (!held || held.token !== lease.token || now() >= held.expiresAt) {
+        throw new Error("search index append without a valid session lease");
+      }
+      held.expiresAt = now() + leaseTtlMs;
+      const index = searchIndex.get(lease.sessionId) ?? [];
+      const seen = new Set(index.map((row) => row.seq));
+      for (const row of rows) {
+        if (seen.has(row.seq)) continue;
+        seen.add(row.seq);
+        index.push({ ...row });
+      }
+      index.sort((a, b) => a.seq - b.seq);
+      searchIndex.set(lease.sessionId, index);
+    },
+
+    async searchIndexCoverage(sessionId): Promise<number> {
+      const index = searchIndex.get(sessionId);
+      return index?.length ? index[index.length - 1]!.seq : -1;
+    },
+
+    async missingSearchEntries(sessionId): Promise<number> {
+      const indexed = new Set((searchIndex.get(sessionId) ?? []).map((row) => row.seq));
+      return (entries.get(sessionId) ?? []).filter(
+        (entry) =>
+          SEARCHABLE_ENTRY_TYPES.has(entry.type) && entrySearchText(entry.payload)?.trim() && !indexed.has(entry.seq),
+      ).length;
+    },
+
+    async lastSearchableEntrySeq(sessionId): Promise<number> {
+      const log = entries.get(sessionId) ?? [];
+      for (let i = log.length - 1; i >= 0; i--) {
+        const e = log[i]!;
+        if (!SEARCHABLE_ENTRY_TYPES.has(e.type)) continue;
+        const text = entrySearchText(e.payload);
+        if (text && text.trim()) return e.seq;
+      }
+      return -1;
+    },
+
+    async scanAll() {
       return [...sessions.values()];
+    },
+
+    async countSessions() {
+      return sessions.size;
+    },
+
+    async listByScope(scope) {
+      return [...sessions.values()]
+        .filter((s) => s.scopeId === scope)
+        .sort((a, b) => b.createdAt - a.createdAt || idDesc(a.id, b.id));
+    },
+
+    async scopeHasSessions(scope) {
+      return [...sessions.values()].some((s) => s.scopeId === scope);
     },
 
     async sessionsByThreadRefs(threadRefs) {
@@ -358,13 +604,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       return [...byScope].map(([scopeId, channelName]) => ({ scopeId, ...(channelName ? { channelName } : {}) }));
     },
 
-    async scopeSessionSummaries(
-      scope,
-      orgWide,
-      page?: SessionPage,
-      includePreviews = true,
-      sessionIds?: string[],
-    ): Promise<SessionSummary[]> {
+    async scopeSessionSummaries(scope, orgWide, page?: SessionPage, sessionIds?: string[]): Promise<SessionSummary[]> {
       const idSet = sessionIds ? new Set(sessionIds) : null;
       const out: SessionSummary[] = [];
       for (const s of sessions.values()) {
@@ -391,11 +631,8 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
           messages: log.length,
           lastActivity: log.length ? log[log.length - 1]!.createdAt : s.createdAt,
           createdAt: s.createdAt,
-          firstMessage: includePreviews && userEntries.length ? userMessagePreview(userEntries[0]!.payload) : "",
-          lastMessage:
-            includePreviews && userEntries.length
-              ? userMessagePreview(userEntries[userEntries.length - 1]!.payload, 100)
-              : "",
+          firstMessage: userEntries.length ? userMessagePreview(userEntries[0]!.payload) : "",
+          lastMessage: userEntries.length ? userMessagePreview(userEntries[userEntries.length - 1]!.payload, 100) : "",
         });
       }
       out.sort((a, b) => b.lastActivity - a.lastActivity || idDesc(a.id, b.id));
@@ -454,6 +691,40 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
       });
     },
 
+    async scopeSessionRollups(scope, orgWide): Promise<ScopeSessionRollup[]> {
+      const rollups = new Map<string, ScopeSessionRollup>();
+      const winners = new Map<string, { at: number; id: string }>();
+      for (const s of sessions.values()) {
+        if (!orgWide && s.scopeId !== scope) continue;
+        const log = entries.get(s.id) ?? [];
+        const turns = log.filter((e) => e.type === "user" && !isOverheardEntry(e)).length;
+        const lastActivity = log.length ? log[log.length - 1]!.createdAt : s.createdAt;
+        const r = rollups.get(s.scopeId) ?? {
+          scopeId: s.scopeId,
+          sessions: 0,
+          backgroundSessions: 0,
+          lastActivity: 0,
+          lastConversationActivity: 0,
+          previewSessionId: null,
+        };
+        rollups.set(s.scopeId, r);
+        r.lastActivity = Math.max(r.lastActivity, lastActivity);
+        if (sessionCategory(sessionOrigin(s.threadRef)) === "background") {
+          r.backgroundSessions += 1;
+          continue;
+        }
+        r.sessions += 1;
+        r.lastConversationActivity = Math.max(r.lastConversationActivity, lastActivity);
+        if (turns === 0) continue;
+        const prev = winners.get(s.scopeId);
+        if (!prev || lastActivity > prev.at || (lastActivity === prev.at && idDesc(s.id, prev.id) < 0)) {
+          winners.set(s.scopeId, { at: lastActivity, id: s.id });
+          r.previewSessionId = s.id;
+        }
+      }
+      return [...rollups.values()];
+    },
+
     async scopeSessionStats(scope, orgWide, category, originFilter, cronId): Promise<ScopeSessionStats> {
       const byType: Record<string, number> = {};
       const byTypeAll: Record<string, number> = {};
@@ -496,7 +767,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
           const buckets = new Map<number, { turns: number; firstAt: number; lastAt: number }>();
           for (const e of log) {
             const t = e.createdAt;
-            if (e.seq < w.validFromSeq || (w.validToSeq !== null && e.seq >= w.validToSeq)) continue;
+            if (!entryWithinTenure(e, w)) continue;
             const day = Math.floor(t / DAY);
             const b = buckets.get(day);
             if (b) {
@@ -515,9 +786,21 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
     async listParticipants() {
       const out: ParticipantWindow[] = [];
       for (const [sessionId, byPrincipal] of windows) {
-        for (const [principalId, w] of byPrincipal) {
-          out.push({ sessionId, principalId, validFrom: w.validFrom, validTo: w.validTo });
-        }
+        for (const [principalId, w] of byPrincipal) out.push(toParticipantWindow(sessionId, principalId, w));
+      }
+      return out;
+    },
+
+    async distinctParticipants() {
+      const out = new Set<string>();
+      for (const byPrincipal of windows.values()) for (const principalId of byPrincipal.keys()) out.add(principalId);
+      return [...out];
+    },
+
+    async participantWindowsOf(sessionId) {
+      const out: ParticipantWindow[] = [];
+      for (const [principalId, w] of windows.get(sessionId) ?? []) {
+        out.push(toParticipantWindow(sessionId, principalId, w));
       }
       return out;
     },

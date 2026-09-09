@@ -23,6 +23,7 @@ export interface Run {
   request: OrchestratorInput;
   result: TurnResult | null;
   deliveryState: RunDeliveryState | null;
+  turnUserSeq: number | null;
   dedupKey: string | null;
   attempts: number;
   errorAttempts: number;
@@ -51,6 +52,7 @@ export interface RunStore {
   readonly maxClaims?: number;
 
   enqueue(input: EnqueueInput): Promise<EnqueueResult>;
+  getByDedupKey(dedupKey: string): Promise<Run | null>;
 
   claim(workerId: string, ttlMs: number): Promise<Run | null>;
 
@@ -66,11 +68,17 @@ export interface RunStore {
 
   setDeliveryState(runId: string, leaseToken: string | null, state: RunDeliveryState): Promise<boolean>;
 
+  noteTurnUserSeq(runId: string, seq: number): Promise<boolean>;
+
   onTerminal(listener: (run: Run) => void): void;
 
   get(runId: string): Promise<Run | null>;
 
   activeForThread(sessionId: string): Promise<Run | null>;
+
+  inFlightForThread(sessionId: string): Promise<Run[]>;
+
+  withdraw(runId: string): Promise<boolean>;
 
   activeSessionIds(): Promise<string[]>;
 
@@ -89,6 +97,10 @@ export interface RunStore {
 const TERMINAL = new Set<Run["status"]>(["done", "failed"]);
 export function isTerminal(status: Run["status"]): boolean {
   return TERMINAL.has(status);
+}
+
+export function releasesDedupKey(result: TurnResult): boolean {
+  return result.refusalKind === "session_busy";
 }
 
 export function errorParks(run: Pick<Run, "errorAttempts" | "maxAttempts" | "attempts">, maxClaims?: number): boolean {

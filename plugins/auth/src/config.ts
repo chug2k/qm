@@ -130,6 +130,12 @@ export function validEmail(value: string): boolean {
   return value.length <= 254 && /^[^@\s,;<>"]+@[^@\s,;<>"]+\.[^@\s,;<>"]+$/.test(value);
 }
 
+export function emailConfigured(cfg: AuthConfig): boolean {
+  const credentials =
+    cfg.transport === "resend" ? [cfg.resendApiKey] : [cfg.smtp.host, cfg.smtp.username, cfg.smtp.password];
+  return [cfg.emailFrom, ...credentials].every((value) => Boolean(value.trim()));
+}
+
 function httpsUrlProblem(label: string, value: string, requireHttps: boolean): string | null {
   if (isMissingOrPlaceholder(value)) return `${label} is required and may not be a placeholder`;
   let url: URL;
@@ -156,7 +162,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
     problems.push("AUTH_CLIENT_SECRET is required and may not be a placeholder");
   else if (cfg.clientSecret.trim().length < 32)
     problems.push(
-      "AUTH_CLIENT_SECRET must be at least 32 characters — it is the portal's only credential at the token endpoint",
+      "AUTH_CLIENT_SECRET must be at least 32 characters; it is the portal's only credential at the token endpoint",
     );
   if (isMissingOrPlaceholder(cfg.tokenSecret))
     problems.push("AUTH_TOKEN_SECRET is required and may not be a placeholder");
@@ -171,7 +177,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
 
   if (!cfg.allowedEmails.length && !cfg.allowedEmailDomain) {
     problems.push(
-      "AUTH_ALLOWED_EMAILS or AUTH_ALLOWED_EMAIL_DOMAIN is required — without one, anybody with an inbox could sign in",
+      "AUTH_ALLOWED_EMAILS or AUTH_ALLOWED_EMAIL_DOMAIN is required; without one, anybody with an inbox could sign in",
     );
   }
   const badEmail = cfg.allowedEmails.find((email) => !validEmail(email) || isMissingOrPlaceholder(email));
@@ -184,29 +190,32 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
     problems.push("AUTH_ALLOWED_EMAIL_DOMAIN must be a valid, non-placeholder email domain when set");
   }
 
-  if (isMissingOrPlaceholder(cfg.emailFrom) || !validEmail(senderAddress(cfg.emailFrom))) {
-    problems.push('AUTH_EMAIL_FROM must be a verified sender address, optionally as "Name <sender@example.com>"');
-  }
-  if (cfg.transport === "resend") {
-    if (isMissingOrPlaceholder(cfg.resendApiKey))
-      problems.push("RESEND_API_KEY is required when AUTH_EMAIL_TRANSPORT is resend");
-  } else {
-    if (isMissingOrPlaceholder(cfg.smtp.host)) problems.push("SMTP_HOST is required when AUTH_EMAIL_TRANSPORT is smtp");
-    if (isMissingOrPlaceholder(cfg.smtp.username))
-      problems.push("SMTP_USERNAME is required when AUTH_EMAIL_TRANSPORT is smtp");
-    if (isMissingOrPlaceholder(cfg.smtp.password))
-      problems.push("SMTP_PASSWORD is required when AUTH_EMAIL_TRANSPORT is smtp");
-    if (!Number.isInteger(cfg.smtp.port) || cfg.smtp.port < 1 || cfg.smtp.port > 65535)
-      problems.push("SMTP_PORT must be a TCP port number");
-    if (isProd && cfg.smtp.tls === "none")
-      problems.push(
-        "SMTP_TLS=none may not be used in production — SMTP credentials would cross the network in cleartext",
-      );
+  if (emailConfigured(cfg)) {
+    if (isMissingOrPlaceholder(cfg.emailFrom) || !validEmail(senderAddress(cfg.emailFrom))) {
+      problems.push('AUTH_EMAIL_FROM must be a verified sender address, optionally as "Name <sender@example.com>"');
+    }
+    if (cfg.transport === "resend") {
+      if (isMissingOrPlaceholder(cfg.resendApiKey))
+        problems.push("RESEND_API_KEY is required when AUTH_EMAIL_TRANSPORT is resend");
+    } else {
+      if (isMissingOrPlaceholder(cfg.smtp.host))
+        problems.push("SMTP_HOST is required when AUTH_EMAIL_TRANSPORT is smtp");
+      if (isMissingOrPlaceholder(cfg.smtp.username))
+        problems.push("SMTP_USERNAME is required when AUTH_EMAIL_TRANSPORT is smtp");
+      if (isMissingOrPlaceholder(cfg.smtp.password))
+        problems.push("SMTP_PASSWORD is required when AUTH_EMAIL_TRANSPORT is smtp");
+      if (!Number.isInteger(cfg.smtp.port) || cfg.smtp.port < 1 || cfg.smtp.port > 65535)
+        problems.push("SMTP_PORT must be a TCP port number");
+      if (isProd && cfg.smtp.tls === "none")
+        problems.push(
+          "SMTP_TLS=none may not be used in production — SMTP credentials would cross the network in cleartext",
+        );
+    }
   }
 
   if (isProd && isMissingOrPlaceholder(cfg.coreSigningSecret)) {
     problems.push(
-      "CORE_SIGNING_SECRET is required — single-use enforcement for links and codes is durable state held by core",
+      "CORE_SIGNING_SECRET is required; single-use enforcement for links and codes is durable state held by core",
     );
   }
   if (cfg.linkTtlS > 3600) problems.push("AUTH_LINK_TTL_S must be at most 3600 seconds");
@@ -220,7 +229,7 @@ export function bootProblems(cfg: AuthConfig, isProd: boolean): string[] {
   ] as const) {
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_RATE_LIMIT_SLOTS) {
       problems.push(
-        `${name} must be a whole number between 1 and ${MAX_RATE_LIMIT_SLOTS} — each unit is one durable claim slot`,
+        `${name} must be a whole number between 1 and ${MAX_RATE_LIMIT_SLOTS}; each unit is one durable claim slot`,
       );
     }
   }

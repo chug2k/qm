@@ -5,12 +5,17 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_FILENAME, loadConfigInDir, type QmConfig } from "../src/config.ts";
-import { currentDeploymentLayerState, deploymentLayerBundle, syncDeploymentLayer } from "../src/deployment-layer.ts";
+import {
+  currentDeploymentLayerState,
+  deploymentLayerBundle,
+  syncDeploymentLayer,
+  httpDeploymentLayerTransport,
+} from "../src/deployment-layer.ts";
+import { dockerDeploymentLayerTransport } from "../src/backends/docker.ts";
+import { flyDeploymentLayerTransport } from "../src/backends/fly.ts";
 import { expectedDescriptors, runConformance } from "../src/commands/conformance.ts";
 
 const SECRET = "conformance-test-secret";
-
-const PINNED_SANDBOX_IMAGE = `registry.fly.io/acme-sandboxes@sha256:${"b".repeat(64)}`;
 
 function writeLayer(dir: string): void {
   mkdirSync(join(dir, "sandbox", "skills", "a"), { recursive: true });
@@ -88,12 +93,18 @@ test("the deployment layer sync rejects a bundle over the core's 1 MB limit befo
       skills: [],
       env: {},
       imageOverrides: {},
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { app: "acme-sandboxes" },
     };
     process.env.CORE_SIGNING_SECRET = SECRET;
     try {
       await assert.rejects(
-        () => syncDeploymentLayer({ config, target: "docker", configDir: dir, sandboxDir: join(dir, "sandbox") }),
+        () =>
+          syncDeploymentLayer({
+            config,
+            transport: dockerDeploymentLayerTransport,
+            configDir: dir,
+            sandboxDir: join(dir, "sandbox"),
+          }),
         /1 MB/,
       );
     } finally {
@@ -111,7 +122,7 @@ test("a missing sandbox directory skips sync instead of replacing the deployed l
   try {
     await syncDeploymentLayer({
       config: makeConfig("http://example.invalid"),
-      target: "docker",
+      transport: dockerDeploymentLayerTransport,
       configDir: dir,
       sandboxDir: join(dir, "sandbox"),
     });
@@ -173,7 +184,7 @@ function makeConfig(publicUrl: string): QmConfig {
     skills: [],
     env: {},
     imageOverrides: {},
-    sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+    sandbox: { app: "acme-sandboxes" },
   };
 }
 
@@ -212,7 +223,7 @@ test("the docker sync PUTs the bundle to the base port with verifiable v0 HMAC s
     await withEnv({ CORE_SIGNING_SECRET: "wrong-ambient-secret", QM_BASE_PORT: String(port) }, () =>
       syncDeploymentLayer({
         config: makeConfig("http://example.invalid"),
-        target: "docker",
+        transport: dockerDeploymentLayerTransport,
         configDir: dir,
         sandboxDir: join(dir, "sandbox"),
       }),
@@ -261,7 +272,7 @@ test("conformance passes against a live core: base-port override, signed request
         target: "docker",
         services: ["core"],
         basePort: 1,
-        sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+        sandbox: { app: "acme-sandboxes" },
       }),
     );
     await withEnv({ CORE_SIGNING_SECRET: SECRET, QM_BASE_PORT: String(port) }, async () => {
@@ -319,7 +330,7 @@ test("conformance fails when the stored layer matches but the core still serves 
         target: "docker",
         services: ["core"],
         basePort: 1,
-        sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+        sandbox: { app: "acme-sandboxes" },
       }),
     );
     await withEnv({ CORE_SIGNING_SECRET: SECRET, QM_BASE_PORT: String(port) }, async () => {
@@ -363,7 +374,7 @@ test("conformance reports a non-JSON layer response as a contract failure, not a
         target: "docker",
         services: ["core"],
         basePort: 1,
-        sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+        sandbox: { app: "acme-sandboxes" },
       }),
     );
     await withEnv({ CORE_SIGNING_SECRET: SECRET, QM_BASE_PORT: String(port) }, async () => {
@@ -408,7 +419,7 @@ test("a successful memory-backed sync warns that the layer will not survive rest
     await withEnv({ CORE_SIGNING_SECRET: SECRET, QM_BASE_PORT: String(port) }, () =>
       syncDeploymentLayer({
         config: makeConfig("http://example.invalid"),
-        target: "docker",
+        transport: dockerDeploymentLayerTransport,
         configDir: dir,
         sandboxDir: join(dir, "sandbox"),
       }),
@@ -429,7 +440,7 @@ test("a publicUrl with a base path keeps it in the request path and the signed c
     await withEnv({ CORE_SIGNING_SECRET: SECRET }, () =>
       syncDeploymentLayer({
         config: makeConfig(`http://127.0.0.1:${port}/base`),
-        target: "aws",
+        transport: httpDeploymentLayerTransport(),
         configDir: dir,
         sandboxDir: join(dir, "sandbox"),
       }),
@@ -456,7 +467,7 @@ test("a non-2xx sync response is a CliError carrying the status and body", async
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
           }),
@@ -479,7 +490,7 @@ test("a 2xx response with unparseable JSON is a CliError with a body snippet, no
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
           }),
@@ -503,7 +514,7 @@ test("a 2xx response with an invalid durability shape fails instead of suppressi
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
           }),
@@ -516,7 +527,7 @@ test("a 2xx response with an invalid durability shape fails instead of suppressi
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
           }),
@@ -537,7 +548,7 @@ test("allowUnavailable swallows an unreachable core but NOT a local config error
     await withEnv({ CORE_SIGNING_SECRET: SECRET, QM_BASE_PORT: String(port) }, () =>
       syncDeploymentLayer({
         config: makeConfig("http://example.invalid"),
-        target: "docker",
+        transport: dockerDeploymentLayerTransport,
         configDir: dir,
         sandboxDir: join(dir, "sandbox"),
         allowUnavailable: true,
@@ -548,7 +559,7 @@ test("allowUnavailable swallows an unreachable core but NOT a local config error
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
           }),
@@ -560,7 +571,7 @@ test("allowUnavailable swallows an unreachable core but NOT a local config error
         () =>
           syncDeploymentLayer({
             config: makeConfig("http://example.invalid"),
-            target: "docker",
+            transport: dockerDeploymentLayerTransport,
             configDir: dir,
             sandboxDir: join(dir, "sandbox"),
             allowUnavailable: true,
@@ -583,7 +594,7 @@ function fakeFly(dir: string, body: string): string {
 function flySyncOpts(dir: string, allowUnavailable?: boolean): Parameters<typeof syncDeploymentLayer>[0] {
   return {
     config: makeConfig("http://example.invalid"),
-    target: "fly",
+    transport: flyDeploymentLayerTransport,
     configDir: dir,
     sandboxDir: join(dir, "sandbox"),
     ...(allowUnavailable !== undefined ? { allowUnavailable } : {}),
@@ -743,7 +754,7 @@ test("a core with no durable layer record bootstraps as empty regardless of its 
     await withEnv({ CORE_SIGNING_SECRET: SECRET }, async () => {
       const state = await currentDeploymentLayerState({
         config: makeConfig("http://localhost:8080"),
-        target: "docker",
+        transport: dockerDeploymentLayerTransport,
         configDir: dir,
       });
       assert.equal(state.body, JSON.stringify({ contract: 1, tools: [], skills: [] }));
@@ -779,12 +790,43 @@ test("a durable record whose bundle is missing still fails the read", async () =
   try {
     await withEnv({ CORE_SIGNING_SECRET: SECRET }, async () => {
       await assert.rejects(
-        currentDeploymentLayerState({ config: makeConfig("http://localhost:8080"), target: "docker", configDir: dir }),
+        currentDeploymentLayerState({
+          config: makeConfig("http://localhost:8080"),
+          transport: dockerDeploymentLayerTransport,
+          configDir: dir,
+        }),
         /did not return a restorable bundle/,
       );
     });
   } finally {
     await new Promise<void>((resolve) => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the bundle carries every file a tool declares under install.files and fails when one is missing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-layer-install-files-"));
+  try {
+    const toolDir = join(dir, "sandbox", "tools", "acme");
+    mkdirSync(toolDir, { recursive: true });
+    writeFileSync(
+      join(toolDir, "tool.json"),
+      JSON.stringify({ id: "acme", install: { binary: "acme", files: [{ from: "acme", to: "/usr/local/bin/acme" }] } }),
+    );
+    assert.throws(
+      () => deploymentLayerBundle(join(dir, "sandbox")),
+      /declares install file acme but .* does not exist/,
+    );
+    writeFileSync(join(toolDir, "acme"), "#!/bin/sh\necho acme\n");
+    chmodSync(join(toolDir, "acme"), 0o755);
+    const bundle = deploymentLayerBundle(join(dir, "sandbox"));
+    assert.deepEqual(
+      bundle.tools.map((file) => file.path),
+      ["tools/acme/acme", "tools/acme/tool.json"],
+    );
+    assert.equal(bundle.tools[0]!.content, "#!/bin/sh\necho acme\n");
+    assert.equal(bundle.tools[0]!.executable, true);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

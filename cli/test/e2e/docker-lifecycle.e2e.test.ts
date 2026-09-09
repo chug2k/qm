@@ -59,7 +59,10 @@ test(
       target: "docker",
       basePort,
       services: [...SERVICES],
+      botName: "straylight",
+      orgName: "Straylight Industries",
       env: { core: { HARNESS: "mock" } },
+      sandbox: { backend: "local", image: "qm-sandbox-local:latest" },
     });
     standInPlugin(dep, "widget");
 
@@ -80,12 +83,52 @@ test(
         }
       });
 
+      await t.test("local sandbox mode gives only core the host Docker socket", () => {
+        const names = deploymentContainers(org);
+        const core = suffix(names, "core")!;
+        const portal = suffix(names, "portal")!;
+        const inspect = (container: string) =>
+          JSON.parse(execFileSync("docker", ["inspect", container], { encoding: "utf8" }))[0] as {
+            Config: { Env: string[] };
+            Mounts: Array<{ Source: string; Destination: string }>;
+          };
+        const coreInfo = inspect(core);
+        assert.ok(coreInfo.Config.Env.includes("DOCKER_HOST=unix:///var/run/docker.sock"));
+        assert.ok(coreInfo.Config.Env.includes(`QM_CORE_CONTAINER=${core}`));
+        assert.ok(coreInfo.Mounts.some((mount) => mount.Destination === "/var/run/docker.sock"));
+        assert.ok(!inspect(portal).Mounts.some((mount) => mount.Destination === "/var/run/docker.sock"));
+      });
+
+      await t.test("services receive their private-network aliases", () => {
+        const portal = suffix(deploymentContainers(org), "portal")!;
+        const aliases = JSON.parse(
+          execFileSync(
+            "docker",
+            ["inspect", "-f", `{{json (index .NetworkSettings.Networks "qm-${org}").Aliases}}`, portal],
+            {
+              encoding: "utf8",
+            },
+          ),
+        ) as string[];
+        assert.ok(aliases.includes(`qm-${org}-portal.internal`), aliases.join(", "));
+      });
+
       await t.test("computed secrets from the deployment ./.env reach the core container", () => {
         const core = suffix(deploymentContainers(org), "core")!;
         const got = execFileSync("docker", ["exec", core, "printenv", "CORE_SIGNING_SECRET"], {
           encoding: "utf8",
         }).trim();
         assert.equal(got, sentinel);
+      });
+
+      await t.test("the configured bot identity reaches the core container and only the core container", () => {
+        const names = deploymentContainers(org);
+        const printenv = (container: string, name: string): string =>
+          execFileSync("docker", ["exec", container, "printenv", name], { encoding: "utf8" }).trim();
+        const core = suffix(names, "core")!;
+        assert.equal(printenv(core, "ORG_BRAND_SELF_LABEL"), "straylight");
+        assert.equal(printenv(core, "ORG_BRAND_ORG_NAME"), "Straylight Industries");
+        assert.throws(() => printenv(suffix(names, "web-ui")!, "ORG_BRAND_SELF_LABEL"));
       });
 
       await t.test("status enumerates exactly this deployment's containers with ports", () => {

@@ -1,5 +1,10 @@
 import { existsSync, readdirSync } from "node:fs";
-import { providerBaseUrlsFromEnv, type ProviderBaseUrls } from "./model/provider-endpoints.ts";
+import {
+  parseProviderBaseUrl,
+  providerBaseUrlsFromEnv,
+  type ModelGatewayTransportConfig,
+  type ProviderBaseUrls,
+} from "./model/provider-endpoints.ts";
 import { join, resolve } from "node:path";
 import {
   parseMemoryCaptureMode,
@@ -8,10 +13,14 @@ import {
   type MemoryRecallMode,
 } from "./memory/policy.ts";
 import { parseMemoryStrategyKind, type MemoryStrategyKind } from "./memory/strategy.ts";
+import { parseMemoryProviderConfig, type MemoryProviderConfig } from "./memory/provider-config.ts";
+import { sanitizeBranding } from "./resolution/branding.ts";
+import type { OrgBranding } from "./resolution/config-store.ts";
 import { validateCoreSecretEnv } from "./deployment/secret-schema.ts";
 import { DEFAULT_CAPTURE_QUIET_MS } from "./memory/strategies/per-turn.ts";
 import { parseSecurityPosture, type SecurityPosture } from "./security/security-posture.ts";
 import { slackPluginConfigFromEnv, type SlackPluginConfig } from "./slack/config.ts";
+import { codexAuthFileForEnv, readCodexOAuthAuthFile } from "./harness/codex-auth-file.ts";
 import {
   MODEL_PROVIDERS,
   defaultModelForProvider,
@@ -29,17 +38,24 @@ export interface Config {
   orgId: string;
   sessionStore: "memory" | "postgres";
   databaseUrl?: string;
+  databaseCaCert?: string;
+  databaseCaCertFile?: string;
   harness: "mock" | "pi" | "opencode" | "codex" | "claude";
   securityPosture: SecurityPosture;
-  sandboxBackend: "aws" | "local" | "sprites";
-  sandboxSecondaryBackend?: "aws" | "local" | "sprites";
-  deployProvider: "docker" | "aws";
+  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
+  sandboxSecondaryBackend?: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
+  deployProvider: "docker" | "aws" | "fly" | "porter";
   egressServiceHosts?: string[];
-  brandingDefault?: { accent?: string; mark?: string; selfLabel?: string };
+  brandingDefault?: OrgBranding;
   modelId?: string;
   opencodeModel?: string;
   codexModel?: string;
   codexBinPath?: string;
+  codexAuthFile?: string;
+  /** Keychain credential id holding the Codex ChatGPT OAuth auth.json (production path). */
+  codexAuthCredential?: string;
+  /** Keychain credential id holding a Claude Code subscription token (production path). */
+  claudeAuthCredential?: string;
   codexProcessEnv: NodeJS.ProcessEnv;
   claudeModel?: string;
   claudeBinPath?: string;
@@ -52,16 +68,20 @@ export interface Config {
   openrouterApiKey?: string;
   modelProvider?: ModelProvider;
   providerBaseUrls: ProviderBaseUrls;
+  modelGateway?: ModelGatewayTransportConfig;
   piCaptureRequests: boolean;
   piSystemCacheSplit: boolean;
   sessionTapeMode: "shadow" | "serve";
   adminGrants?: string;
+  emailAuthPrincipals?: string[];
+  emailAuthDomain?: string;
+  resendApiKey?: string;
+  emailFrom?: string;
   rateLimitPerWindow: number;
   rateLimitWindowMs: number;
   budgetUsdPerWindow?: number;
   orgBudgetUsdPerWindow?: number;
   budgetWindowMs: number;
-  maxContextEntries?: number;
   maxContextTokens?: number;
   execTimeoutDefaultMs: number;
   execTimeoutMaxMs: number;
@@ -82,6 +102,7 @@ export interface Config {
   portalIdentitySecret?: string;
   requireSignedPortalIdentity?: boolean;
   connectorSecretKey?: string;
+  slackEventsPort?: number;
   secretsBackend: "env" | "aws";
   secretsPrefix: string;
   apiBaseUrl?: string;
@@ -112,6 +133,7 @@ export interface Config {
   memoryRecall: MemoryRecallMode;
   memoryCapture: MemoryCaptureMode;
   memoryStrategy: MemoryStrategyKind;
+  memoryProviderConfig?: MemoryProviderConfig;
   memoryConsolidateAfter?: number;
   memoryCaptureQuietMs: number;
   memoryCaptureMaxTurns?: number;
@@ -124,6 +146,7 @@ export interface Config {
   maxClaims: number;
   processReaperIntervalMs: number;
   approvalSummaryTimeoutMs: number;
+  turnLeaseWaitMs: number;
   securityScreenTimeoutMs: number;
   securityScreenBackend: "model" | "proxy";
   securityScreenProxy?: {
@@ -132,8 +155,6 @@ export interface Config {
     token: string;
     shadow: boolean;
   };
-  insightsIntervalMs: number;
-  reachDeniedNotifyChannel?: string;
   scratchExecEnabled: boolean;
   reachExecEnabled: boolean;
   sharedOwnerAuthIsolation: boolean;
@@ -142,7 +163,15 @@ export interface Config {
   awsSandbox: AwsSandboxEnv;
   localSandbox: LocalSandboxEnv;
   spritesSandbox: SpritesSandboxEnv;
+  smolmachinesSandbox: SmolmachinesSandboxEnv;
+  agent37Sandbox: Agent37SandboxEnv;
+  e2bSandbox: E2bSandboxEnv;
+  modalSandbox: ModalSandboxEnv;
+  porterSandbox: PorterSandboxEnv;
+  porterDeploy: PorterDeployEnv;
   awsDeploy: AwsDeployEnv;
+  deployAppsDomain?: string;
+  flyDeploy: FlyDeployEnv;
 }
 
 export function configuredModelForHarness(config: Config, harness: string): string | undefined {
@@ -157,11 +186,28 @@ export function providerKeysPresent(config: Config): ModelProviderAvailability {
     anthropic: Boolean(config.anthropicApiKey),
     openai: Boolean(config.openaiApiKey),
     openrouter: Boolean(config.openrouterApiKey),
+    ...(config.harness === "codex" && (config.codexAuthFile || config.codexAuthCredential) ? { codexOAuth: true } : {}),
   };
 }
 
 export function baseModelProviders(config: Config): ModelProviderAvailability | undefined {
   return config.modelProvider ? onlyProvider(config.modelProvider) : undefined;
+}
+
+export function harnessCarriedModelAuth(config: Config): ModelProvider | undefined {
+  if (
+    config.harness === "claude" &&
+    (config.claudeAuthCredential ||
+      config.claudeProcessEnv.CLAUDE_CODE_OAUTH_TOKEN ||
+      config.claudeProcessEnv.ANTHROPIC_AUTH_TOKEN)
+  )
+    return "anthropic";
+  if (
+    config.harness === "codex" &&
+    (config.codexAuthCredential || config.codexAuthFile || config.codexProcessEnv.CODEX_ACCESS_TOKEN)
+  )
+    return "openai";
+  return undefined;
 }
 
 interface AwsSandboxEnv {
@@ -224,6 +270,7 @@ function awsSandboxEnv(env: NodeJS.ProcessEnv): AwsSandboxEnv {
     ...(numEnvStrict("AWS_SANDBOX_SNAPSHOT_INTERVAL_MS", env.AWS_SANDBOX_SNAPSHOT_INTERVAL_MS) !== undefined
       ? { snapshotIntervalMs: numEnvStrict("AWS_SANDBOX_SNAPSHOT_INTERVAL_MS", env.AWS_SANDBOX_SNAPSHOT_INTERVAL_MS) }
       : {}),
+    ...(env.QM_CORE_CONTAINER ? { coreContainer: env.QM_CORE_CONTAINER } : {}),
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
       : {}),
@@ -244,6 +291,7 @@ interface LocalSandboxEnv {
   dockerBin?: string;
   cpus?: number;
   memoryMb?: number;
+  coreContainer?: string;
   defaultTimeoutSec?: number;
 }
 
@@ -283,6 +331,235 @@ function spritesSandboxEnv(env: NodeJS.ProcessEnv): SpritesSandboxEnv {
   };
 }
 
+interface E2bSandboxEnv {
+  apiKey?: string;
+  templateId?: string;
+  namePrefix?: string;
+  sandboxTtlSec?: number;
+
+  proxy?: string;
+
+  egressProxyUrl?: string;
+  snapshotS3Bucket?: string;
+  snapshotIntervalSec?: number;
+  defaultTimeoutSec?: number;
+}
+
+function e2bSandboxEnv(env: NodeJS.ProcessEnv): E2bSandboxEnv {
+  return {
+    ...(env.E2B_API_KEY ? { apiKey: env.E2B_API_KEY } : {}),
+    ...(env.E2B_TEMPLATE_ID ? { templateId: env.E2B_TEMPLATE_ID } : {}),
+    ...(env.E2B_NAME_PREFIX ? { namePrefix: env.E2B_NAME_PREFIX } : {}),
+    ...(numEnvStrict("E2B_SANDBOX_TTL_SEC", env.E2B_SANDBOX_TTL_SEC) !== undefined
+      ? { sandboxTtlSec: numEnvStrict("E2B_SANDBOX_TTL_SEC", env.E2B_SANDBOX_TTL_SEC) }
+      : {}),
+    ...(env.E2B_PROXY ? { proxy: env.E2B_PROXY } : {}),
+    ...(env.E2B_EGRESS_PROXY_URL ? { egressProxyUrl: env.E2B_EGRESS_PROXY_URL } : {}),
+    ...(env.E2B_SNAPSHOT_S3_BUCKET ? { snapshotS3Bucket: env.E2B_SNAPSHOT_S3_BUCKET } : {}),
+    ...(numEnvStrict("E2B_SNAPSHOT_INTERVAL_SEC", env.E2B_SNAPSHOT_INTERVAL_SEC) !== undefined
+      ? { snapshotIntervalSec: numEnvStrict("E2B_SNAPSHOT_INTERVAL_SEC", env.E2B_SNAPSHOT_INTERVAL_SEC) }
+      : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
+interface ModalSandboxEnv {
+  tokenId?: string;
+  tokenSecret?: string;
+  appName?: string;
+  environment?: string;
+  image?: string;
+  namePrefix?: string;
+  cpus?: number;
+  memoryMb?: number;
+  regions?: string[];
+  sandboxTimeoutSec?: number;
+  rotateAfterSec?: number;
+  reapIdleSec?: number;
+  egressProxyUrl?: string;
+  snapshotS3Bucket?: string;
+  snapshotIntervalSec?: number;
+  defaultTimeoutSec?: number;
+}
+
+function modalSandboxEnv(env: NodeJS.ProcessEnv): ModalSandboxEnv {
+  const num = (name: string): number | undefined => numEnvStrict(name, env[name]);
+  return {
+    ...(env.MODAL_TOKEN_ID ? { tokenId: env.MODAL_TOKEN_ID } : {}),
+    ...(env.MODAL_TOKEN_SECRET ? { tokenSecret: env.MODAL_TOKEN_SECRET } : {}),
+    ...(env.MODAL_APP_NAME ? { appName: env.MODAL_APP_NAME } : {}),
+    ...(env.MODAL_ENVIRONMENT ? { environment: env.MODAL_ENVIRONMENT } : {}),
+    ...(env.MODAL_IMAGE ? { image: env.MODAL_IMAGE } : {}),
+    ...(env.MODAL_NAME_PREFIX ? { namePrefix: env.MODAL_NAME_PREFIX } : {}),
+    ...(num("MODAL_CPUS") !== undefined ? { cpus: num("MODAL_CPUS") } : {}),
+    ...(num("MODAL_MEMORY_MB") !== undefined ? { memoryMb: num("MODAL_MEMORY_MB") } : {}),
+    ...(env.MODAL_REGIONS?.trim()
+      ? {
+          regions: env.MODAL_REGIONS.split(",")
+            .map((r) => r.trim())
+            .filter(Boolean),
+        }
+      : {}),
+    ...(num("MODAL_SANDBOX_TIMEOUT_SEC") !== undefined ? { sandboxTimeoutSec: num("MODAL_SANDBOX_TIMEOUT_SEC") } : {}),
+    ...(num("MODAL_ROTATE_AFTER_SEC") !== undefined ? { rotateAfterSec: num("MODAL_ROTATE_AFTER_SEC") } : {}),
+    ...(num("MODAL_REAP_IDLE_SEC") !== undefined ? { reapIdleSec: num("MODAL_REAP_IDLE_SEC") } : {}),
+    ...(env.MODAL_EGRESS_PROXY_URL ? { egressProxyUrl: env.MODAL_EGRESS_PROXY_URL } : {}),
+    ...(env.MODAL_SNAPSHOT_S3_BUCKET ? { snapshotS3Bucket: env.MODAL_SNAPSHOT_S3_BUCKET } : {}),
+    ...(num("MODAL_SNAPSHOT_INTERVAL_SEC") !== undefined
+      ? { snapshotIntervalSec: num("MODAL_SNAPSHOT_INTERVAL_SEC") }
+      : {}),
+    ...(num("SANDBOX_TIMEOUT_SEC") !== undefined ? { defaultTimeoutSec: num("SANDBOX_TIMEOUT_SEC") } : {}),
+  };
+}
+
+interface SmolmachinesSandboxEnv {
+  token?: string;
+  baseUrl?: string;
+  namePrefix?: string;
+  image?: string;
+  cpus?: number;
+  memoryMb?: number;
+  diskGb?: number;
+  egressProxyUrl?: string;
+  defaultTimeoutSec?: number;
+}
+
+function smolmachinesSandboxEnv(env: NodeJS.ProcessEnv): SmolmachinesSandboxEnv {
+  return {
+    ...(env.SMOLMACHINES_TOKEN ? { token: env.SMOLMACHINES_TOKEN } : {}),
+    ...(env.SMOLMACHINES_BASE_URL ? { baseUrl: env.SMOLMACHINES_BASE_URL } : {}),
+    ...(env.SMOLMACHINES_NAME_PREFIX ? { namePrefix: env.SMOLMACHINES_NAME_PREFIX } : {}),
+    ...(env.SMOLMACHINES_IMAGE ? { image: env.SMOLMACHINES_IMAGE } : {}),
+    ...(numEnvStrict("SMOLMACHINES_CPUS", env.SMOLMACHINES_CPUS) !== undefined
+      ? { cpus: numEnvStrict("SMOLMACHINES_CPUS", env.SMOLMACHINES_CPUS) }
+      : {}),
+    ...(numEnvStrict("SMOLMACHINES_MEMORY_MB", env.SMOLMACHINES_MEMORY_MB) !== undefined
+      ? { memoryMb: numEnvStrict("SMOLMACHINES_MEMORY_MB", env.SMOLMACHINES_MEMORY_MB) }
+      : {}),
+    ...(numEnvStrict("SMOLMACHINES_DISK_GB", env.SMOLMACHINES_DISK_GB) !== undefined
+      ? { diskGb: numEnvStrict("SMOLMACHINES_DISK_GB", env.SMOLMACHINES_DISK_GB) }
+      : {}),
+    ...(env.SMOLMACHINES_EGRESS_PROXY_URL ? { egressProxyUrl: env.SMOLMACHINES_EGRESS_PROXY_URL } : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
+interface PorterSandboxEnv {
+  image?: string;
+  token?: string;
+  baseUrl?: string;
+  namePrefix?: string;
+  homeDir?: string;
+  ttlSec?: number;
+  egressProxyUrl?: string;
+  defaultTimeoutSec?: number;
+}
+
+interface PorterDeployEnv {
+  token?: string;
+  baseUrl?: string;
+  runnerImage?: string;
+  appsDomain?: string;
+  visibility?: "public" | "private";
+  namePrefix?: string;
+  ttlSec?: number;
+}
+
+function porterApiBaseUrl(env: NodeJS.ProcessEnv): string | undefined {
+  const deployProjectId = numEnvStrict("PORTER_DEPLOY_PROJECT_ID", env.PORTER_DEPLOY_PROJECT_ID);
+  const deployClusterId = numEnvStrict("PORTER_DEPLOY_CLUSTER_ID", env.PORTER_DEPLOY_CLUSTER_ID);
+  const derived =
+    deployProjectId !== undefined && deployClusterId !== undefined
+      ? `${(env.PORTER_DEPLOY_URL ?? "https://dashboard.porter.run").replace(/\/+$/, "")}/api/v2/alpha/projects/${deployProjectId}/clusters/${deployClusterId}`
+      : undefined;
+  return env.PORTER_SANDBOX_BASE_URL ?? derived;
+}
+
+const porterLocatorPresent = (env: NodeJS.ProcessEnv): boolean =>
+  Boolean(porterApiBaseUrl(env) || env.PORTER_CLUSTER_ID || env.KUBERNETES_SERVICE_HOST);
+
+function porterDeployVisibilityStrict(value: string | undefined): PorterDeployEnv["visibility"] {
+  if (value === undefined || value.trim() === "") return undefined;
+  const visibility = value.trim();
+  if (visibility === "public" || visibility === "private") return visibility;
+  throw new Error(
+    `PORTER_DEPLOY_VISIBILITY=${JSON.stringify(value)} is not recognized — use public or private, or unset it.`,
+  );
+}
+
+function porterDeployEnv(env: NodeJS.ProcessEnv): PorterDeployEnv {
+  const token = env.PORTER_DEPLOY_API_TOKEN;
+  const baseUrl = porterApiBaseUrl(env);
+  const visibility = porterDeployVisibilityStrict(env.PORTER_DEPLOY_VISIBILITY);
+  const ttlSec = numEnvStrict("PORTER_DEPLOY_TTL_SEC", env.PORTER_DEPLOY_TTL_SEC);
+  const runnerImage = env.PORTER_DEPLOY_RUNNER_IMAGE ?? env.PORTER_SANDBOX_IMAGE;
+  return {
+    ...(token ? { token } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(runnerImage ? { runnerImage } : {}),
+    ...(env.PORTER_DEPLOY_APPS_DOMAIN ? { appsDomain: env.PORTER_DEPLOY_APPS_DOMAIN } : {}),
+    ...(visibility ? { visibility } : {}),
+    ...(env.PORTER_SANDBOX_NAME_PREFIX ? { namePrefix: env.PORTER_SANDBOX_NAME_PREFIX } : {}),
+    ...(ttlSec !== undefined ? { ttlSec } : {}),
+  };
+}
+
+function porterSandboxEnv(env: NodeJS.ProcessEnv): PorterSandboxEnv {
+  const token = env.PORTER_DEPLOY_API_TOKEN;
+  const baseUrl = porterApiBaseUrl(env);
+  const ttlSec = numEnvStrict("PORTER_SANDBOX_TTL_SEC", env.PORTER_SANDBOX_TTL_SEC);
+  return {
+    ...(env.PORTER_SANDBOX_IMAGE ? { image: env.PORTER_SANDBOX_IMAGE } : {}),
+    ...(token ? { token } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(env.PORTER_SANDBOX_NAME_PREFIX ? { namePrefix: env.PORTER_SANDBOX_NAME_PREFIX } : {}),
+    ...(env.PORTER_SANDBOX_HOME ? { homeDir: env.PORTER_SANDBOX_HOME } : {}),
+    ...(ttlSec !== undefined ? { ttlSec } : {}),
+    ...(env.PORTER_SANDBOX_EGRESS_PROXY_URL ? { egressProxyUrl: env.PORTER_SANDBOX_EGRESS_PROXY_URL } : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
+interface Agent37SandboxEnv {
+  apiKey?: string;
+  baseUrl?: string;
+  namePrefix?: string;
+  template?: string;
+  cpus?: number;
+  memoryGb?: number;
+  diskGb?: number;
+  egressProxyUrl?: string;
+  defaultTimeoutSec?: number;
+}
+
+function agent37SandboxEnv(env: NodeJS.ProcessEnv): Agent37SandboxEnv {
+  return {
+    ...(env.AGENT37_API_KEY ? { apiKey: env.AGENT37_API_KEY } : {}),
+    ...(env.AGENT37_API_BASE_URL ? { baseUrl: env.AGENT37_API_BASE_URL } : {}),
+    ...(env.AGENT37_NAME_PREFIX ? { namePrefix: env.AGENT37_NAME_PREFIX } : {}),
+    ...(env.AGENT37_TEMPLATE ? { template: env.AGENT37_TEMPLATE } : {}),
+    ...(numEnvStrict("AGENT37_CPUS", env.AGENT37_CPUS) !== undefined
+      ? { cpus: numEnvStrict("AGENT37_CPUS", env.AGENT37_CPUS) }
+      : {}),
+    ...(numEnvStrict("AGENT37_MEMORY_GB", env.AGENT37_MEMORY_GB) !== undefined
+      ? { memoryGb: numEnvStrict("AGENT37_MEMORY_GB", env.AGENT37_MEMORY_GB) }
+      : {}),
+    ...(numEnvStrict("AGENT37_DISK_GB", env.AGENT37_DISK_GB) !== undefined
+      ? { diskGb: numEnvStrict("AGENT37_DISK_GB", env.AGENT37_DISK_GB) }
+      : {}),
+    ...(env.AGENT37_EGRESS_PROXY_URL ? { egressProxyUrl: env.AGENT37_EGRESS_PROXY_URL } : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
 interface AwsDeployEnv {
   region: string;
   profile?: string;
@@ -306,14 +583,71 @@ interface AwsDeployEnv {
   dataRoleArn?: string;
 }
 
-function deployAppsEnv(env: NodeJS.ProcessEnv): { deployAppsSessionSecret?: string; deployAppsLoginUrl?: string } {
-  const secret = env.DEPLOY_APPS_SESSION_SECRET;
-  const loginUrl = env.DEPLOY_APPS_LOGIN_URL;
-  if (!!secret !== !!loginUrl) {
-    throw new Error("DEPLOY_APPS_SESSION_SECRET and DEPLOY_APPS_LOGIN_URL must be set together");
+function deployAppsEnv(
+  env: NodeJS.ProcessEnv,
+  defaultLoginUrl: string | undefined,
+): { deployAppsSessionSecret?: string; deployAppsLoginUrl?: string } {
+  const explicit = env.DEPLOY_APPS_SESSION_SECRET;
+  const shared = env.PORTAL_SESSION_SECRET;
+  const loginUrl = env.DEPLOY_APPS_LOGIN_URL ?? (explicit || shared ? defaultLoginUrl : undefined);
+  if (loginUrl && !explicit && !shared) {
+    throw new Error("DEPLOY_APPS_LOGIN_URL requires DEPLOY_APPS_SESSION_SECRET");
   }
+  if (explicit && !loginUrl) {
+    throw new Error("DEPLOY_APPS_SESSION_SECRET needs a sign-in address — set DEPLOY_APPS_LOGIN_URL or PUBLIC_WEB_URL");
+  }
+  const secret = explicit ?? (loginUrl ? shared : undefined);
   if (!secret || !loginUrl) return {};
   return { deployAppsSessionSecret: secret, deployAppsLoginUrl: loginUrl.replace(/\/$/, "") };
+}
+
+const SHARED_PLATFORM_SUFFIXES = [
+  "onporter.run",
+  "withporter.run",
+  "porter.run",
+  "fly.dev",
+  "herokuapp.com",
+  "onrender.com",
+  "railway.app",
+  "vercel.app",
+  "netlify.app",
+  "ondigitalocean.app",
+  "azurewebsites.net",
+  "elasticbeanstalk.com",
+  "amazonaws.com",
+  "cloudfront.net",
+  "github.io",
+  "pages.dev",
+  "workers.dev",
+];
+
+function sharedPlatformSuffixOf(domain: string): string | undefined {
+  const host = domain.toLowerCase();
+  return SHARED_PLATFORM_SUFFIXES.find((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+const HOSTNAME_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+const HOSTNAME_RE = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})+$`);
+
+function deployAppsDomainEnv(env: NodeJS.ProcessEnv, deployProvider: string): string | undefined {
+  const raw = env.DEPLOY_APPS_DOMAIN?.trim();
+  if (raw) {
+    const canonical = raw.toLowerCase().replace(/\.$/, "");
+    if (!HOSTNAME_RE.test(canonical)) {
+      throw new Error(
+        `DEPLOY_APPS_DOMAIN (${raw}) is not a plain DNS name — set it to a bare domain like apps.example.com (no scheme, port, path, or wildcard prefix).`,
+      );
+    }
+    const suffix = sharedPlatformSuffixOf(canonical);
+    if (suffix) {
+      throw new Error(
+        `DEPLOY_APPS_DOMAIN (${canonical}) is under ${suffix}, a shared platform domain that cannot carry per-app subdomains — attach a custom domain you control (set DEPLOY_APPS_DOMAIN=apps.<your-domain> with a wildcard DNS record pointing at this instance), or unset it to keep serving apps signed-in at /d/<app>/.`,
+      );
+    }
+    return canonical;
+  }
+  if (deployProvider === "porter" && env.PORTER_DEPLOY_APPS_DOMAIN) return env.PORTER_DEPLOY_APPS_DOMAIN;
+  return env.AWS_DEPLOY_APPS_DOMAIN;
 }
 
 function awsDeployEnv(env: NodeJS.ProcessEnv): AwsDeployEnv {
@@ -371,6 +705,24 @@ function awsDeployEnv(env: NodeJS.ProcessEnv): AwsDeployEnv {
   };
 }
 
+interface FlyDeployEnv {
+  token: string;
+  appPrefix: string;
+  baseImage: string;
+  org: string;
+  region?: string;
+}
+
+function flyDeployEnv(env: NodeJS.ProcessEnv): FlyDeployEnv {
+  return {
+    token: env.FLY_DEPLOY_API_TOKEN ?? "",
+    appPrefix: env.FLY_DEPLOY_APP_PREFIX ?? "",
+    baseImage: env.FLY_DEPLOY_BASE_IMAGE ?? "",
+    org: env.FLY_ORG ?? "",
+    ...(env.FLY_REGION ? { region: env.FLY_REGION } : {}),
+  };
+}
+
 const DEFAULT_ORG_ID = "default-org";
 
 export function orgId(): string {
@@ -403,8 +755,8 @@ export const CONFIG_DEFAULTS = {
   cronFireConcurrency: 4,
   monitorHeartbeatSec: 180,
   approvalSummaryTimeoutMs: 6_000,
+  turnLeaseWaitMs: 5_000,
   securityScreenTimeoutMs: 15_000,
-  insightsIntervalMs: 5 * 60_000,
   workers: 16,
   leaseTtlMs: 120_000,
   heartbeatIntervalMs: 10_000,
@@ -450,17 +802,12 @@ function numEnvStrict(name: string, value: string | undefined): number | undefin
 }
 
 function orgBrandingFromEnv(env: NodeJS.ProcessEnv): Config["brandingDefault"] {
-  const clean = (v: string | undefined): string =>
-    (v ?? "").replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029<>]/g, "").trim();
-  const accentRaw = clean(env.ORG_BRAND_ACCENT);
-  const accent = /^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(accentRaw) ? accentRaw : undefined;
-  const mark =
-    clean(env.ORG_BRAND_MARK)
-      .replace(/["\\{}]/g, "")
-      .slice(0, 2) || undefined;
-  const selfLabel = clean(env.ORG_BRAND_SELF_LABEL).slice(0, 40) || undefined;
-  const branding = { ...(accent ? { accent } : {}), ...(mark ? { mark } : {}), ...(selfLabel ? { selfLabel } : {}) };
-  return Object.keys(branding).length ? branding : undefined;
+  return sanitizeBranding({
+    accent: env.ORG_BRAND_ACCENT,
+    mark: env.ORG_BRAND_MARK,
+    selfLabel: env.ORG_BRAND_SELF_LABEL,
+    orgName: env.ORG_BRAND_ORG_NAME,
+  });
 }
 
 function harnessEnvStrict(value: string | undefined): Config["harness"] {
@@ -473,11 +820,41 @@ function harnessEnvStrict(value: string | undefined): Config["harness"] {
   );
 }
 
+export function enabledSandboxBackends(config: Config): Array<Config["sandboxBackend"]> {
+  const credentialed: Record<Config["sandboxBackend"], boolean> = {
+    local: Boolean(config.localSandbox?.image),
+    sprites: Boolean(config.spritesSandbox?.token),
+    smolmachines: Boolean(config.smolmachinesSandbox?.token),
+    agent37: Boolean(config.agent37Sandbox?.apiKey),
+    e2b: Boolean(config.e2bSandbox?.apiKey),
+    modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
+    aws: Boolean(config.awsSandbox?.s3Bucket),
+    porter: Boolean(config.porterSandbox?.token),
+  };
+  const enabled = new Set<Config["sandboxBackend"]>([config.sandboxBackend]);
+  for (const [name, on] of Object.entries(credentialed)) {
+    if (on) enabled.add(name as Config["sandboxBackend"]);
+  }
+  return [...enabled];
+}
+
 function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACKEND"): Config["sandboxBackend"] {
   if (value === undefined || value.trim() === "") return "local";
   const backend = value.trim();
-  if (backend === "aws" || backend === "local" || backend === "sprites") return backend;
-  throw new Error(`${name}=${JSON.stringify(value)} is not recognized — use aws, local, or sprites, or unset it.`);
+  if (
+    backend === "aws" ||
+    backend === "local" ||
+    backend === "sprites" ||
+    backend === "smolmachines" ||
+    backend === "e2b" ||
+    backend === "modal" ||
+    backend === "agent37" ||
+    backend === "porter"
+  )
+    return backend;
+  throw new Error(
+    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, or agent37, or unset it.`,
+  );
 }
 
 function secretsBackendEnvStrict(value: string | undefined, prefix: string): Config["secretsBackend"] {
@@ -522,6 +899,33 @@ function csvPaths(value: string | undefined): string[] | undefined {
     .map((p) => resolve(p));
 }
 
+function modelGatewayFromEnv(env: NodeJS.ProcessEnv): ModelGatewayTransportConfig | undefined {
+  const names = ["MODEL_GATEWAY_URL", "MODEL_GATEWAY_API_KEY", "MODEL_GATEWAY_API_KEY_HEADER", "MODEL_GATEWAY_MODELS"];
+  if (!names.some((name) => env[name]?.trim())) return undefined;
+  for (const name of names) {
+    if (!env[name]?.trim()) throw new Error(`${name} is required when model gateway routing is configured`);
+  }
+  const apiKeyHeader = env.MODEL_GATEWAY_API_KEY_HEADER!.trim();
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(apiKeyHeader)) {
+    throw new Error("MODEL_GATEWAY_API_KEY_HEADER must be a valid HTTP header name");
+  }
+  const models: Record<string, string> = {};
+  for (const mapping of env.MODEL_GATEWAY_MODELS!.split(",")) {
+    const separator = mapping.indexOf("=");
+    const source = mapping.slice(0, separator).trim();
+    const target = mapping.slice(separator + 1).trim();
+    if (separator < 1 || !source || !target) throw new Error(`invalid MODEL_GATEWAY_MODELS mapping: ${mapping}`);
+    if (models[source]) throw new Error(`duplicate MODEL_GATEWAY_MODELS source: ${source}`);
+    models[source] = target;
+  }
+  return {
+    url: parseProviderBaseUrl("MODEL_GATEWAY_URL", env.MODEL_GATEWAY_URL!),
+    apiKey: env.MODEL_GATEWAY_API_KEY!,
+    apiKeyHeader,
+    models,
+  };
+}
+
 function defaultPluginSkillDirs(): string[] {
   const root = resolve("./plugins");
   try {
@@ -553,9 +957,29 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const missingSecrets = validateCoreSecretEnv(env);
+  const harness = harnessEnvStrict(env.HARNESS);
+  const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
+  const claudeAuthCredential = env.CLAUDE_AUTH_CREDENTIAL?.trim() || undefined;
+  const codexAuthCandidate = harness === "codex" && !codexAuthCredential ? codexAuthFileForEnv(env, true) : undefined;
+  const codexOAuthConfigured = Boolean(codexAuthCandidate && readCodexOAuthAuthFile(codexAuthCandidate));
+  const secretEnv =
+    codexOAuthConfigured && codexAuthCandidate
+      ? { ...env, CODEX_AUTH_FILE: codexAuthCandidate }
+      : { ...env, CODEX_AUTH_FILE: undefined };
+  const deployAppsDomain = deployAppsDomainEnv(env, env.DEPLOY_PROVIDER ?? "docker");
+  const missingSecrets = validateCoreSecretEnv(secretEnv);
   if (missingSecrets.length) {
     throw new Error(`missing or insecure required core secrets: ${missingSecrets.join(", ")}`);
+  }
+  if (harness === "codex" && !env.OPENAI_API_KEY?.trim() && !codexOAuthConfigured && !codexAuthCredential) {
+    throw new Error(
+      "HARNESS=codex needs OPENAI_API_KEY, a keychain credential via CODEX_AUTH_CREDENTIAL, or a readable ChatGPT OAuth auth.json via CODEX_AUTH_FILE (or ~/.codex/auth.json)",
+    );
+  }
+  if (env.NODE_ENV === "production" && codexOAuthConfigured) {
+    throw new Error(
+      "CODEX_AUTH_FILE is supported for local Codex harnesses only; production must use CODEX_AUTH_CREDENTIAL (keychain custody)",
+    );
   }
   const modelProvider = modelProviderEnvStrict(env);
   for (const key of ["SESSION_STORE", "RUN_STORE", "ARTIFACT_STORE"] as const) {
@@ -566,6 +990,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
           `or use the in-memory default (${key === "ARTIFACT_STORE" ? "unset ARTIFACT_STORE" : `${key}=memory`}) for an ephemeral store.`,
       );
     }
+  }
+  if (env.E2B_API_KEY && !env.E2B_SNAPSHOT_S3_BUCKET) {
+    console.warn(
+      "[config] e2b sandbox backend enabled without E2B_SNAPSHOT_S3_BUCKET — home snapshots are held in memory only, so a core restart plus an expired pause LOSES scope files; set E2B_SNAPSHOT_S3_BUCKET for durable snapshots.",
+    );
+  }
+  if (env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET && !env.MODAL_SNAPSHOT_S3_BUCKET) {
+    console.warn(
+      "[config] modal sandbox backend enabled without MODAL_SNAPSHOT_S3_BUCKET — home snapshots are held in memory only, and modal has no pause: a core restart, an idle reap, or the 24h lifetime wall LOSES scope files; set MODAL_SNAPSHOT_S3_BUCKET for durable snapshots.",
+    );
   }
   if (env.NODE_ENV === "production" && harnessEnvStrict(env.HARNESS) === "mock") {
     console.warn(
@@ -578,16 +1012,45 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
   const dataDir = resolve(env.DATA_DIR ?? "./data");
+  const porterSandboxSelected = env.SANDBOX_BACKEND === "porter";
+  if (porterSandboxSelected && !env.PORTER_SANDBOX_EGRESS_PROXY_URL) {
+    console.warn(
+      "[config] SANDBOX_BACKEND=porter without PORTER_SANDBOX_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set PORTER_SANDBOX_EGRESS_PROXY_URL to the egress proxy to force sandbox traffic through it.",
+    );
+  }
+  if (env.DEPLOY_PROVIDER === "porter" && !env.PORTER_DEPLOY_APPS_DOMAIN && !env.DEPLOY_APPS_DOMAIN) {
+    console.warn(
+      "[config] DEPLOY_PROVIDER=porter without an apps domain — published apps use hostnames assigned by the cluster and are reachable signed-in at /d/<app>/; set DEPLOY_APPS_DOMAIN to a domain you control to serve each app on its own subdomain.",
+    );
+  }
+  for (const [selected, label] of [
+    [porterSandboxSelected, "SANDBOX_BACKEND=porter"],
+    [env.DEPLOY_PROVIDER === "porter", "DEPLOY_PROVIDER=porter"],
+  ] as const) {
+    if (selected && !porterLocatorPresent(env)) {
+      throw new Error(
+        `${label} requires PORTER_DEPLOY_PROJECT_ID and PORTER_DEPLOY_CLUSTER_ID (or PORTER_SANDBOX_BASE_URL, or PORTER_CLUSTER_ID) to locate the Porter sandbox API.`,
+      );
+    }
+  }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
-    throw new Error("SANDBOX_BACKEND must be set explicitly in production — use sprites, aws, or local.");
+    throw new Error(
+      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, aws, or local.",
+    );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
-  const secondaryRaw = env.SANDBOX_SECONDARY_BACKEND?.trim();
-  let sandboxSecondaryBackend: Config["sandboxSecondaryBackend"];
-  if (secondaryRaw) {
-    const secondary = sandboxBackendEnvStrict(secondaryRaw, "SANDBOX_SECONDARY_BACKEND");
-    if (secondary === sandboxBackend) throw new Error("SANDBOX_SECONDARY_BACKEND must differ from SANDBOX_BACKEND.");
-    sandboxSecondaryBackend = secondary;
+  if (env.SANDBOX_SECONDARY_BACKEND?.trim()) {
+    console.warn(
+      `[config] SANDBOX_SECONDARY_BACKEND=${JSON.stringify(env.SANDBOX_SECONDARY_BACKEND.trim())} is retired and ignored — every backend whose credential is present is constructed; per-scope routes pick between them. Remove the variable.`,
+    );
+  }
+  const retiredBrainEnv = ["BRAIN", "BRAIN_MCP_URL", "BRAIN_RO_CLIENT_ID", "BRAIN_RW_CLIENT_ID"].filter((name) =>
+    env[name]?.trim(),
+  );
+  if (retiredBrainEnv.length) {
+    console.warn(
+      `[config] ${retiredBrainEnv.join(", ")} ${retiredBrainEnv.length === 1 ? "is" : "are"} retired and ignored — the brain integration was removed; point an external knowledge server at MEMORY_PROVIDER_CONFIG (docs/memory-providers.md). Remove the variables.`,
+    );
   }
   const securityScreenBackend = securityScreenBackendEnvStrict(env.SECURITY_SCREEN_BACKEND);
   const proxyProvider = env.SECURITY_SCREEN_PROXY_PROVIDER?.trim();
@@ -635,10 +1098,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const publicApiUrl = env.PUBLIC_API_URL ?? env.AGENT_API_URL;
   const publicUrl = env.PUBLIC_WEB_URL ?? publicApiUrl;
-  const deployProvider: "aws" | "docker" = env.DEPLOY_PROVIDER === "aws" ? "aws" : "docker";
+  const deployProvider = env.DEPLOY_PROVIDER ?? "docker";
+  if (
+    deployProvider !== "aws" &&
+    deployProvider !== "docker" &&
+    deployProvider !== "fly" &&
+    deployProvider !== "porter"
+  ) {
+    throw new Error(
+      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, or porter)`,
+    );
+  }
   let runStore: "memory" | "postgres" = env.SESSION_STORE === "postgres" ? "postgres" : "memory";
   if (env.RUN_STORE === "memory" || env.RUN_STORE === "postgres") runStore = env.RUN_STORE;
+  const codexEnv = { ...env };
+  if (codexOAuthConfigured && codexAuthCandidate) codexEnv.CODEX_AUTH_FILE = codexAuthCandidate;
+  else delete codexEnv.CODEX_AUTH_FILE;
   const providerBaseUrls = providerBaseUrlsFromEnv(env);
+  const modelGateway = modelGatewayFromEnv(env);
   const codexProcessEnv = Object.fromEntries(
     [
       "PATH",
@@ -656,7 +1133,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "CODEX_ACCESS_TOKEN",
       "HOME",
       "CODEX_HOME",
-    ].flatMap((name) => (env[name] === undefined ? [] : [[name, env[name]]])),
+      "CODEX_AUTH_FILE",
+    ].flatMap((name) => (codexEnv[name] === undefined ? [] : [[name, codexEnv[name]]])),
   ) as NodeJS.ProcessEnv;
   const claudeProcessEnv = Object.fromEntries(
     [
@@ -684,6 +1162,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     numEnvStrict("RUN_MAX_AGE_MS", env.RUN_MAX_AGE_MS) ??
     (turnWallClockMs > 0 ? 2 * turnWallClockMs : CONFIG_DEFAULTS.runMaxAgeMs);
   const slack = slackPluginConfigFromEnv(env);
+  const slackEventsPort =
+    env.SLACK_EVENTS_MODE?.trim() === "http" ? numEnvStrict("SLACK_EVENTS_PORT", env.SLACK_EVENTS_PORT) : undefined;
+  if (
+    slackEventsPort !== undefined &&
+    (!Number.isSafeInteger(slackEventsPort) || slackEventsPort <= 0 || slackEventsPort > 65_535)
+  ) {
+    throw new Error("SLACK_EVENTS_PORT must be an integer from 1 through 65535");
+  }
+  const memoryProviderConfig = parseMemoryProviderConfig(env.MEMORY_PROVIDER_CONFIG, env);
   return {
     production: env.NODE_ENV === "production",
     allowUnauthenticatedCore: boolEnvStrict("ALLOW_UNAUTHENTICATED_CORE", env.ALLOW_UNAUTHENTICATED_CORE) ?? false,
@@ -692,7 +1179,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     orgId: env.ORG_ID ?? DEFAULT_ORG_ID,
     sessionStore: env.SESSION_STORE === "postgres" ? "postgres" : "memory",
     ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),
-    harness: harnessEnvStrict(env.HARNESS),
+    ...(env.DATABASE_CA_CERT ? { databaseCaCert: env.DATABASE_CA_CERT } : {}),
+    ...(env.DATABASE_CA_CERT_FILE ? { databaseCaCertFile: env.DATABASE_CA_CERT_FILE } : {}),
+    harness,
     securityPosture: securityPostureEnvStrict(env.HARNESS_SECURITY_POSTURE),
     securityScreenBackend,
     ...(securityScreenBackend === "proxy"
@@ -706,7 +1195,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         }
       : {}),
     sandboxBackend,
-    ...(sandboxSecondaryBackend ? { sandboxSecondaryBackend } : {}),
     deployProvider,
     ...(env.EGRESS_SERVICE_HOSTS
       ? {
@@ -720,6 +1208,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.OPENCODE_MODEL || env.PI_MODEL ? { opencodeModel: env.OPENCODE_MODEL || env.PI_MODEL } : {}),
     ...(env.CODEX_MODEL ? { codexModel: env.CODEX_MODEL } : {}),
     ...(env.CODEX_BIN ? { codexBinPath: env.CODEX_BIN } : {}),
+    ...(codexOAuthConfigured && codexAuthCandidate ? { codexAuthFile: codexAuthCandidate } : {}),
+    ...(codexAuthCredential ? { codexAuthCredential } : {}),
+    ...(claudeAuthCredential ? { claudeAuthCredential } : {}),
     codexProcessEnv,
     ...(env.CLAUDE_MODEL ? { claudeModel: env.CLAUDE_MODEL } : {}),
     ...(env.CLAUDE_BIN ? { claudeBinPath: env.CLAUDE_BIN } : {}),
@@ -732,7 +1223,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.OPENROUTER_API_KEY ? { openrouterApiKey: env.OPENROUTER_API_KEY } : {}),
     ...(modelProvider ? { modelProvider } : {}),
     providerBaseUrls,
+    ...(modelGateway ? { modelGateway } : {}),
     ...(env.ADMIN_GRANTS ? { adminGrants: env.ADMIN_GRANTS } : {}),
+    ...(env.AUTH_ALLOWED_EMAILS
+      ? {
+          emailAuthPrincipals: [
+            ...new Set(
+              env.AUTH_ALLOWED_EMAILS.split(",")
+                .map((email) => email.trim().toLowerCase())
+                .filter(Boolean),
+            ),
+          ],
+        }
+      : {}),
+    ...(env.AUTH_ALLOWED_EMAIL_DOMAIN?.trim()
+      ? { emailAuthDomain: env.AUTH_ALLOWED_EMAIL_DOMAIN.trim().toLowerCase() }
+      : {}),
+    ...(env.RESEND_API_KEY?.trim() ? { resendApiKey: env.RESEND_API_KEY.trim() } : {}),
+    ...(env.AUTH_EMAIL_FROM?.trim() ? { emailFrom: env.AUTH_EMAIL_FROM.trim() } : {}),
     piCaptureRequests: boolEnvStrict("PI_CAPTURE_REQUESTS", env.PI_CAPTURE_REQUESTS) ?? true,
     piSystemCacheSplit: boolEnvStrict("PI_SYSTEM_CACHE_SPLIT", env.PI_SYSTEM_CACHE_SPLIT) ?? false,
     sessionTapeMode: env.SESSION_TAPE_MODE === "shadow" ? "shadow" : "serve",
@@ -747,9 +1255,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? { orgBudgetUsdPerWindow: numEnvStrict("ORG_BUDGET_USD_PER_WINDOW", env.ORG_BUDGET_USD_PER_WINDOW) }
       : {}),
     budgetWindowMs: numEnvStrict("BUDGET_WINDOW_MS", env.BUDGET_WINDOW_MS) ?? CONFIG_DEFAULTS.budgetWindowMs,
-    ...(numEnvStrict("MAX_CONTEXT_ENTRIES", env.MAX_CONTEXT_ENTRIES) !== undefined
-      ? { maxContextEntries: numEnvStrict("MAX_CONTEXT_ENTRIES", env.MAX_CONTEXT_ENTRIES) }
-      : {}),
     ...(numEnvStrict("MAX_CONTEXT_TOKENS", env.MAX_CONTEXT_TOKENS) !== undefined
       ? { maxContextTokens: numEnvStrict("MAX_CONTEXT_TOKENS", env.MAX_CONTEXT_TOKENS) }
       : {}),
@@ -785,8 +1290,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : {}),
     requireSignedPortalIdentity: env.REQUIRE_SIGNED_PORTAL_IDENTITY === "1",
     ...(env.CONNECTOR_SECRET_KEY ? { connectorSecretKey: env.CONNECTOR_SECRET_KEY } : {}),
+    ...(slackEventsPort !== undefined ? { slackEventsPort } : {}),
     secretsBackend: secretsBackendEnvStrict(env.SECRETS_BACKEND, env.SECRETS_PREFIX ?? ""),
     secretsPrefix: env.SECRETS_PREFIX ?? "",
+    layerEnv: { ...env },
     ...(publicApiUrl ? { apiBaseUrl: publicApiUrl } : {}),
     ...(publicUrl ? { publicUrl } : {}),
     ...(env.PUBLIC_WEB_URL ? { publicWebUrl: env.PUBLIC_WEB_URL } : {}),
@@ -798,10 +1305,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     skillsSeedDir: resolve(env.SKILLS_SEED_DIR ?? "./skills-seed"),
     pluginSkillDirs: csvPaths(env.PLUGIN_SKILLS_DIRS) ?? defaultPluginSkillDirs(),
     ...(env.DEPLOYMENT_LAYER ? { deploymentLayerDir: resolve(env.DEPLOYMENT_LAYER) } : {}),
-    layerEnv: { ...env },
     memoryRecall: parseMemoryRecallMode(env.MEMORY_RECALL),
     memoryCapture: parseMemoryCaptureMode(env.MEMORY_CAPTURE),
     memoryStrategy: parseMemoryStrategyKind(env.MEMORY_STRATEGY),
+    ...(memoryProviderConfig ? { memoryProviderConfig } : {}),
     ...(numEnvStrict("MEMORY_CONSOLIDATE_AFTER", env.MEMORY_CONSOLIDATE_AFTER) !== undefined
       ? { memoryConsolidateAfter: numEnvStrict("MEMORY_CONSOLIDATE_AFTER", env.MEMORY_CONSOLIDATE_AFTER) }
       : {}),
@@ -821,7 +1328,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployGitDir: env.DEPLOY_GIT_DIR ? resolve(env.DEPLOY_GIT_DIR) : join(dataDir, "deploy-git"),
     deployDialTimeoutMs:
       numEnvStrict("DEPLOY_DIAL_TIMEOUT_MS", env.DEPLOY_DIAL_TIMEOUT_MS) ?? CONFIG_DEFAULTS.deployDialTimeoutMs,
-    ...deployAppsEnv(env),
+    ...deployAppsEnv(env, publicUrl),
     deepIdleMachineMs:
       numEnvStrict("DEEP_IDLE_MACHINE_MS", env.DEEP_IDLE_MACHINE_MS) ?? CONFIG_DEFAULTS.deepIdleMachineMs,
     devIdleMachineMs: numEnvStrict("DEV_IDLE_MACHINE_MS", env.DEV_IDLE_MACHINE_MS) ?? CONFIG_DEFAULTS.devIdleMachineMs,
@@ -842,10 +1349,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     approvalSummaryTimeoutMs:
       numEnvStrict("APPROVAL_SUMMARY_TIMEOUT_MS", env.APPROVAL_SUMMARY_TIMEOUT_MS) ??
       CONFIG_DEFAULTS.approvalSummaryTimeoutMs,
+    turnLeaseWaitMs: numEnvStrict("TURN_LEASE_WAIT_MS", env.TURN_LEASE_WAIT_MS) ?? CONFIG_DEFAULTS.turnLeaseWaitMs,
     securityScreenTimeoutMs,
-    insightsIntervalMs:
-      numEnvStrict("INSIGHTS_INTERVAL_MS", env.INSIGHTS_INTERVAL_MS) ?? CONFIG_DEFAULTS.insightsIntervalMs,
-    ...(env.REACH_DENIED_NOTIFY_CHANNEL ? { reachDeniedNotifyChannel: env.REACH_DENIED_NOTIFY_CHANNEL.trim() } : {}),
     scratchExecEnabled: boolEnvStrict("EXECUTE_SCRATCH", env.EXECUTE_SCRATCH) ?? false,
     reachExecEnabled: boolEnvStrict("REACH_EXEC", env.REACH_EXEC) ?? false,
     sharedOwnerAuthIsolation: boolEnvStrict("SHARED_OWNER_AUTH_ISOLATION", env.SHARED_OWNER_AUTH_ISOLATION) ?? false,
@@ -854,6 +1359,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     awsSandbox: awsSandboxEnv(env),
     localSandbox: localSandboxEnv(env),
     spritesSandbox: spritesSandboxEnv(env),
-    awsDeploy: awsDeployEnv(env),
+    smolmachinesSandbox: smolmachinesSandboxEnv(env),
+    agent37Sandbox: agent37SandboxEnv(env),
+    porterSandbox: porterSandboxEnv(env),
+    porterDeploy: porterDeployEnv(env),
+    e2bSandbox: e2bSandboxEnv(env),
+    modalSandbox: modalSandboxEnv(env),
+    awsDeploy: {
+      ...awsDeployEnv(env),
+      ...(env.DEPLOY_APPS_DOMAIN && deployAppsDomain && !env.AWS_DEPLOY_APPS_DOMAIN
+        ? { appsDomain: deployAppsDomain }
+        : {}),
+    },
+    ...(deployAppsDomain ? { deployAppsDomain } : {}),
+    flyDeploy: flyDeployEnv(env),
   };
 }

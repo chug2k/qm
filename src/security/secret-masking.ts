@@ -1,6 +1,5 @@
 const NON_SECRET_ENV_KEYS = new Set([
   "AGENT_API_URL",
-  "AGENT_OUTBOX",
   "AWS_REGION",
   "AWS_DEFAULT_REGION",
   "BROWSE_LAB_MAX_STEPS",
@@ -21,6 +20,7 @@ export function createSecretValueMasker(env: Record<string, string> | undefined)
     const uri = encodeURIComponent(value);
     if (uri !== value) variants.push({ needle: uri, label: key });
     variants.push({ needle: Buffer.from(value, "utf8").toString("base64").replace(/=+$/, ""), label: key });
+    variants.push({ needle: Buffer.from(value, "utf8").toString("base64url"), label: key });
   }
   if (!variants.length) return (text) => text;
   variants.sort((a, b) => b.needle.length - a.needle.length);

@@ -2,6 +2,12 @@ import type { ResolvedSecurityPolicy } from "./security/security-posture.ts";
 
 export type PrincipalType = "internal" | "guest";
 
+export const PRINCIPAL_TYPES = ["internal", "guest"] as const satisfies readonly PrincipalType[];
+
+export function isPrincipalType(value: unknown): value is PrincipalType {
+  return typeof value === "string" && (PRINCIPAL_TYPES as readonly string[]).includes(value);
+}
+
 export interface Principal {
   id: string;
   type: PrincipalType;
@@ -80,6 +86,7 @@ export interface Session {
   awaitingInput?: boolean;
   backgroundJobs?: number;
   watches?: number;
+  crons?: number;
 }
 
 export type EntryType =
@@ -165,6 +172,7 @@ export interface Destination {
   target: string;
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
+  threadTs?: string;
   editRef?: string;
   taskList?: Array<{
     id: string;
@@ -174,8 +182,10 @@ export interface Destination {
   unfurlLinks?: boolean;
   react?: { messageTs: string; emoji: string };
   delete?: { messageTs: string };
+  pin?: { messageTs: string; remove?: boolean };
   identity?: string;
   debugFooter?: string;
+  webTranscript?: { kind: "reply" } | { kind: "turn_failure"; notBefore: number; runId?: string };
 }
 
 export interface CandidateDestination extends Destination {
@@ -186,6 +196,7 @@ export interface CandidateDestination extends Destination {
 export type BackgroundWakeTrigger = "cron" | "webhook" | "monitor" | (string & {});
 
 export interface DeliveryProvenance {
+  sourceTitle?: string;
   trigger: BackgroundWakeTrigger;
   surface: string;
   fireKey: string;
@@ -208,23 +219,72 @@ export interface CronFireLogEntry {
   threadRef: string;
   firedAt: number;
   scheduledAt?: number;
-  status?: TurnResult["status"];
+  status?: TurnResult["status"] | "running" | "deferred";
+  endedAt?: number;
   note?: string;
   reply?: string;
   sessionId?: string;
 }
 
+export interface CronFireNote {
+  text: string;
+  at: number;
+  by?: string;
+}
+
 export interface Cron extends TriggerBase {
   schedule: CronSchedule;
   nextFireAt?: number;
+  lastAttemptAt?: number;
+  deferUntil?: number;
   title?: string;
   archived?: boolean;
   action?: string;
   message?: string;
+  loopId?: string;
   createdAt: number;
   runAs?: "owner" | "scopeFloor" | "scopeShared";
   members?: Principal[];
+  unattendedGrants?: string[];
+
   fireLog?: CronFireLogEntry[];
+  lastFireNote?: CronFireNote;
+}
+
+interface WebhookVerification {
+  scheme: "hmac-sha256" | "github" | "slack" | "stripe";
+  secret?: string;
+}
+
+interface WebhookFilter {
+  path: string;
+  in: string[];
+}
+
+export interface Webhook extends TriggerBase {
+  action: string;
+  verification: WebhookVerification;
+  filters?: WebhookFilter[];
+  lastDeliveryId?: string;
+  lastError?: string;
+}
+
+interface WebhookVerification {
+  scheme: "hmac-sha256" | "github" | "slack" | "stripe";
+  secret?: string;
+}
+
+interface WebhookFilter {
+  path: string;
+  in: string[];
+}
+
+export interface Webhook extends TriggerBase {
+  action: string;
+  verification: WebhookVerification;
+  filters?: WebhookFilter[];
+  lastDeliveryId?: string;
+  lastError?: string;
 }
 
 export interface Monitor extends TriggerBase {
@@ -239,6 +299,161 @@ export interface Monitor extends TriggerBase {
   lastError?: string;
 }
 
+export type LoopState = "enabled" | "paused" | "quarantined" | "archived";
+
+export type LoopHealth = "healthy" | "degraded" | "failing" | "quarantined";
+
+export type ShipGate = "hold" | "auto";
+
+export interface ShipActionPolicy {
+  action: string;
+  gate: ShipGate;
+}
+
+export interface LoopCaps {
+  maxItemsPerFire?: number;
+  maxOpenOutputs?: number;
+  maxItemAttempts?: number;
+}
+
+export interface LoopGovernorConfig {
+  maxConsecutiveFailedFires?: number;
+  maxQueueDepth?: number;
+  maxQueueAgeMs?: number;
+  maxReturnRate?: number;
+  returnRateMinDecisions?: number;
+  staleFireMs?: number;
+}
+
+interface LoopPlaybookRevision {
+  version: number;
+  at: number;
+  by: string;
+  note?: string;
+}
+
+export interface Loop extends TriggerBase {
+  name: string;
+  purpose?: string;
+  surface?: string;
+  sources?: string[];
+  playbook: string;
+  playbookVersion: number;
+  playbookHistory: LoopPlaybookRevision[];
+  policyVersion: number;
+  successCondition: string;
+  successChecks?: string[];
+  shipActions: ShipActionPolicy[];
+  caps?: LoopCaps;
+  governor?: LoopGovernorConfig;
+  state: LoopState;
+  health: LoopHealth;
+  healthReason?: string;
+  throttle?: boolean;
+  cronId?: string;
+  runAs?: "owner" | "scopeFloor" | "scopeShared";
+  consecutiveFailedFires?: number;
+  quarantineClearedBy?: string;
+  quarantineClearedAt?: number;
+}
+
+export type LoopItemStatus = "queued" | "in_progress" | "ready" | "shipped" | "failed" | "skipped";
+
+export type LoopSourcePayload = Record<string, unknown>;
+
+export interface LoopProposal {
+  data: LoopSourcePayload;
+  summary?: string;
+  by: "agent" | "human";
+  at: number;
+  sessionId?: string;
+}
+
+export interface LoopThreadMessage {
+  id: string;
+  role: "human" | "agent" | "system";
+  text: string;
+  at: number;
+  actorId?: string;
+}
+
+export interface LoopItem {
+  id: string;
+  loopId: string;
+  sourceKey: string;
+  sourceSummary?: string;
+  source?: string;
+  sourcePayload?: LoopSourcePayload;
+  sourceAt?: number;
+  proposal?: LoopProposal;
+  agentDrafts?: LoopProposal[];
+  agentMentionKeys?: string[];
+  thread?: LoopThreadMessage[];
+  status: LoopItemStatus;
+  attempts: number;
+  runIds: string[];
+  outputIds: string[];
+  parkedReason?: string;
+  guidance?: string;
+  actedAt?: number;
+  actionKind?: string;
+  actionResult?: string;
+  claimedAt?: number;
+  claimToken?: string;
+  decisionAt?: number;
+  decisionToken?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type LoopOutputState =
+  "staged" | "ready" | "shipping" | "unconfirmed" | "shipped" | "returned" | "superseded" | "expired";
+
+export interface LoopShipResult {
+  status?: TurnResult["status"];
+  note?: string;
+  reply?: string;
+  sessionId?: string;
+}
+
+export interface LoopOutput {
+  id: string;
+  loopId: string;
+  itemId: string;
+  attemptId: string;
+  shipAction: string;
+  label?: string;
+  externalRef?: string;
+  title: string;
+  summary?: string;
+  state: LoopOutputState;
+  capturedBy: "ledger" | "classifier" | "agent";
+  createdAt: number;
+  updatedAt: number;
+  decidedBy?: string;
+  decidedAt?: number;
+  decisionNote?: string;
+  claimedAt?: number;
+  claimToken?: string;
+  shipFireKey?: string;
+  shipResult?: LoopShipResult;
+  supersedesOutputIds?: string[];
+  supersededByOutputIds?: string[];
+}
+
+export interface ShipGrant {
+  id: string;
+  loopId: string;
+  shipAction: string;
+  label?: string;
+  actorId: string;
+  policyVersion: number;
+  createdAt: number;
+  revokedAt?: number;
+  revokedBy?: string;
+  revocationHistory?: Array<{ revokedAt: number; revokedBy: string }>;
+}
+
 export interface Delivery {
   id: string;
   destination: Destination;
@@ -248,6 +463,7 @@ export interface Delivery {
   idempotencyKey: string;
   createdAt: number;
   deliveredAt: number | null;
+  expiredAt?: number;
   shadow?: boolean;
   recipientThreadRef?: string;
   deliverLatencyMs?: number;
@@ -266,6 +482,7 @@ export interface SurfaceContextQuery {
   viewerToken?: string;
   file?: { ts: string; threadTs?: string; name?: string };
   openGroup?: { participants: string[] };
+  syncDirectory?: boolean;
 }
 
 export interface SurfaceContextResult {
@@ -333,6 +550,7 @@ export interface AttachmentMeta {
   direction: "in" | "out";
   author?: string;
   artifactId?: string;
+  sourceId?: string;
 }
 
 export interface GatewayContext {
@@ -340,7 +558,7 @@ export interface GatewayContext {
   details?: Record<string, string>;
   instructions?: string;
   reactionGuidance?: string;
-  botName?: string;
+  botHandle?: string;
 }
 
 export interface ConversationTurn {
@@ -386,11 +604,13 @@ export interface TurnRequest {
   entryTs?: string;
   gatewayContext?: GatewayContext;
   triggered?: boolean;
+  unattendedGrants?: string[];
   securityScreenData?: string;
   triggerDestination?: Destination;
   ownerKeychainUnion?: boolean;
   unprompted?: boolean;
   liveActor?: boolean;
+  botActor?: boolean;
   conversationHeader?: string;
   priorTurns?: ConversationTurn[];
   overheard?: OverheardMessage[];
@@ -416,6 +636,7 @@ export interface TurnRequest {
   proactiveOpener?: boolean;
   spawned?: boolean;
   idempotencyKey?: string;
+  redeliveryKey?: string;
   async?: boolean;
 }
 
@@ -434,10 +655,11 @@ export interface PendingApproval {
   matched?: string;
   purpose?: string;
   summary?: string;
+  summaryDetail?: string;
   approvalKey?: string;
   grantModes?: ApprovalGrantModes;
   blocksInput?: boolean;
-  kind?: "approval";
+  kind?: "approval" | "input";
 }
 
 export interface PendingApprovalRecord {
@@ -448,6 +670,7 @@ export interface PendingApprovalRecord {
   matched?: string;
   purpose?: string;
   summary?: string;
+  summaryDetail?: string;
   approvalKey?: string;
   grantModes?: ApprovalGrantModes;
   request?: TurnRequest;
@@ -477,7 +700,7 @@ export interface TurnResult {
   reply?: string;
   reactions?: string[];
   reason?: string;
-  refusalKind?: "security_quarantine";
+  refusalKind?: "security_quarantine" | "session_busy";
   adminUrl?: string;
   runId?: string;
   steered?: true;

@@ -1,8 +1,10 @@
 import { join } from "node:path";
 import { interpolateSplitEnv } from "../deployment/deployment-layer.ts";
-import { BASE_RESIDENT_AUTH_PATHS, residentAuthPaths, type CredentialPathSpec } from "../credentials/resident-paths.ts";
-import type { ExecResult, Sandbox, SandboxHandle } from "../sandbox/sandbox.ts";
-import { CapabilityUnsupportedError, hasParentPathSegment, supportsAgentComputerBackup } from "../sandbox/sandbox.ts";
+import type { CredentialPathSpec } from "../credentials/resident-paths.ts";
+import type { ComputerStatus, ExecResult, Sandbox, SandboxHandle } from "../sandbox/sandbox.ts";
+import { ROUTE_CACHE_TTL_MS, type SandboxBackendName } from "../sandbox/sandbox-routing.ts";
+import type { SandboxMigrationRunner } from "../sandbox/sandbox-migration-runner.ts";
+import { CapabilityUnsupportedError, hasParentPathSegment, supportsAgentComputerExport } from "../sandbox/sandbox.ts";
 import type {
   CommandPolicy,
   CommandRule,
@@ -34,15 +36,16 @@ import type {
 } from "../connectors/background-exec-broker.ts";
 import type { MonitorBroker, BackgroundWatchResult, BackgroundUnwatchResult } from "../monitors/monitor-broker.ts";
 import type { DeployService, DeployFile } from "../deploy/deploy-service.ts";
-import { publicUrlOf } from "../deploy/deploy-store.ts";
+import { publicUrlOf, type Deployment } from "../deploy/deploy-store.ts";
 import { carriesGitMetadata } from "../deploy/deploy-fs.ts";
 import type { AclStore } from "../acl/acl-store.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
 import { mimeFromName } from "../core/attachments.ts";
-import { swallow } from "../util/errors.ts";
-import { fileArtifactId, type FileArtifactStore } from "../files/file-artifact-store.ts";
+import { swallow, errMessage } from "../util/errors.ts";
+import { fileArtifactId, isArtifactPath, type FileArtifactStore } from "../files/file-artifact-store.ts";
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { MEMORY_FILE, type MemoryService } from "../memory/memory-service.ts";
+import type { McpToolService, McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import type { ReachResolution } from "../resolution/scope-reach.ts";
 import type {
   ControlService,
@@ -51,13 +54,16 @@ import type {
   CronPatchRequest,
   CronRunsRequest,
   CronRunsResult,
+  WebhookCreateRequest,
+  WebhookCreateResult,
   ControlOk,
   ControlErr,
 } from "../api/control-service.ts";
 import type { ShareArtifactRequest, ShareArtifactResult } from "../api/artifact-share.ts";
-import type { Cron } from "../types.ts";
+import type { Cron, Webhook } from "../types.ts";
 import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { VisibleCron } from "../api/app.ts";
+import { createPlaygroundArtifact, type PlaygroundArtifact } from "../playgrounds/playground.ts";
 
 const SKILL_SKILLMD_RE = /^(?:\.\/)?skills\/([^/]+)\/SKILL\.md$/;
 function skillTreeDirFor(path: string): string | null {
@@ -79,6 +85,7 @@ export interface PublishInput {
   renameFrom?: string;
   env?: Record<string, string>;
   rollbackTo?: number;
+  alwaysOn?: boolean;
   share?: Array<{ scope: ScopeId; permission: Permission }>;
 }
 
@@ -98,6 +105,12 @@ interface PublishResult {
   url: string;
   audience?: PublishAudienceDescriptor;
   dataDir?: string;
+  alwaysOn?: boolean;
+}
+
+function deploymentEntrypoint(d: Deployment | null): string | undefined {
+  if (!d) return undefined;
+  return d.versions.find((v) => v.version === d.currentVersion)?.entrypoint || undefined;
 }
 
 export class NeedsApproval extends Error {
@@ -127,6 +140,7 @@ export class CommandDenied extends Error {
 interface ReadResult {
   content: string | null;
   sourceScopeId: ScopeId | null;
+  shared?: true;
 }
 
 export interface ShareDirective {
@@ -143,7 +157,35 @@ interface ReachedProvenance {
   label: string;
 }
 
+export interface CommandCredential {
+  handle: string;
+  env: Array<{ key: string; value: string }>;
+}
+
+interface AttachedFileMeta {
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  artifactId?: string;
+}
+
+export type AttachResult = { ok: true; files: AttachedFileMeta[]; staged: number } | { ok: false; message: string };
+
+export type AttachFiles = (files: readonly string[]) => Promise<AttachResult>;
+
 export interface ToolContext extends SurfaceToolDeps {
+  attach: AttachFiles;
+  commandCredentialHandles?: readonly string[];
+  credentialExecServices?: readonly { service: string; binary: string }[];
+  credentialExec?(
+    service: string,
+    args: string[],
+    opts?: { timeoutSeconds?: number; signal?: AbortSignal },
+  ): Promise<ExecResult>;
+  registerLogin?(
+    service: string,
+    paths: readonly CredentialPathSpec[],
+  ): Promise<{ service: string; captured: boolean }>;
   execute(
     command: string,
     opts?: {
@@ -152,16 +194,24 @@ export interface ToolContext extends SurfaceToolDeps {
       ownerAuth?: boolean;
       reachTarget?: string;
       signal?: AbortSignal;
+      credentials?: string[];
     },
   ): Promise<ExecResult & { reached?: ReachedProvenance }>;
+  computerStatus(): Promise<ComputerStatus>;
+  restartComputer(): Promise<void>;
+  migrateComputer(to: string): Promise<{ from: string; to: string }>;
   read(path: string): Promise<ReadResult>;
   write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult>;
   publish(input: PublishInput): Promise<PublishResult>;
+  createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact>;
   memorySearch(q: string, limit?: number): Promise<string[] | null>;
   memoryRead(): Promise<string | null>;
   memoryRemember(facts: string[]): Promise<number | null>;
   memoryRewrite(content: string): Promise<true | null>;
   history(q: string, limit?: number): Promise<string[]>;
+  historyOpen(seq: number): Promise<string | null>;
+  mcpToolDefs(): McpToolDescriptor[];
+  callMcpTool(name: string, args: Record<string, unknown>): Promise<string>;
   backgroundStart(command: string, opts?: { ttlSeconds?: number }): Promise<BackgroundStartResult>;
   backgroundPoll(
     processId: string,
@@ -190,6 +240,12 @@ export interface ToolContext extends SurfaceToolDeps {
     | ControlErr<"not_found" | "forbidden" | "bad_request" | "cron_update_failed">
     | ControlUnavailable
   >;
+  cronNote(
+    id: string,
+    note: string,
+  ): Promise<
+    ControlOk<{ applied: boolean }> | ControlErr<"not_found" | "forbidden" | "bad_request"> | ControlUnavailable
+  >;
   cronDelete(
     id: string,
   ): Promise<ControlOk<Record<never, never>> | ControlErr<"not_found" | "forbidden"> | ControlUnavailable>;
@@ -200,8 +256,8 @@ export interface ToolContext extends SurfaceToolDeps {
   cronRun(
     id: string,
   ): Promise<
-    | ControlOk<Record<never, never>>
-    | ControlErr<"not_found" | "forbidden" | "unavailable" | "bad_request">
+    | ControlOk<{ fireKey: string }>
+    | ControlErr<"not_found" | "forbidden" | "unavailable" | "bad_request" | "already_running">
     | ControlUnavailable
   >;
   cronRetarget(
@@ -210,6 +266,11 @@ export interface ToolContext extends SurfaceToolDeps {
   ): Promise<
     ControlOk<{ cron: Cron }> | ControlErr<"not_found" | "forbidden" | "unknown_destination"> | ControlUnavailable
   >;
+  webhookCreate(req: WebhookCreateRequest): Promise<WebhookCreateResult | ControlUnavailable>;
+  webhookList(): Promise<Webhook[] | ControlUnavailable>;
+  webhookDisable(
+    id: string,
+  ): Promise<ControlOk<Record<never, never>> | ControlErr<"not_found" | "forbidden"> | ControlUnavailable>;
   soulRead(): { effectiveSoul: string; soul: string | null; soulVersion: number } | ControlUnavailable;
   soulWrite(
     content: string,
@@ -253,11 +314,19 @@ export interface SurfaceDeleteInput {
   participants?: readonly string[];
 }
 
+export interface PostedFileMeta {
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  artifactId?: string;
+}
+
 export interface SurfacePostResult {
   ok: boolean;
   deliveryId?: string;
   message?: string;
   matched?: string;
+  attachments?: PostedFileMeta[];
 }
 
 interface SurfaceReadResult {
@@ -305,7 +374,8 @@ interface SurfaceFileResult {
 }
 
 type SurfaceStandingOrderResult =
-  { ok: true; orders: string; bots?: Record<string, BotPolicy> } | { ok: false; message: string };
+  | { ok: true; orders: string; bots?: Record<string, BotPolicy>; ambientEnabled?: boolean }
+  | { ok: false; message: string };
 
 export interface SurfaceToolDeps {
   post(text: string, opts?: SurfacePostOpts, files?: readonly string[]): Promise<SurfacePostResult>;
@@ -319,7 +389,11 @@ export interface SurfaceToolDeps {
   readMembers(): Promise<SurfaceMembersResult>;
   readFile(ref: string): Promise<SurfaceFileResult>;
   getStandingOrder(): Promise<SurfaceStandingOrderResult>;
-  setStandingOrder(orders: string, bots?: Record<string, BotPolicy>): Promise<SurfaceStandingOrderResult>;
+  setStandingOrder(
+    orders: string,
+    bots?: Record<string, BotPolicy>,
+    ambientEnabled?: boolean | null,
+  ): Promise<SurfaceStandingOrderResult>;
   staySilent(reason: string): Promise<{ ok: true; message: string }>;
 }
 
@@ -331,15 +405,20 @@ export interface ControlUnavailable {
 export const CONTROL_UNAVAILABLE: ControlUnavailable = {
   ok: false,
   code: "control_unavailable",
-  message: "the control plane (crons, standing instructions) isn't available on this turn",
+  message: "the control plane (crons, webhooks, standing instructions) isn't available on this turn",
 };
 
 export interface ToolContextDeps {
   sandbox: Sandbox;
+  credentialExecServices?: readonly { service: string; binary: string }[];
+  credentialExec?: ToolContext["credentialExec"];
+  registerLogin?: ToolContext["registerLogin"];
+  commandCredentials?: readonly CommandCredential[];
   provision: () => Promise<SandboxHandle>;
   provisionScratch?: () => Promise<SandboxHandle>;
   provisionOwnerAuth?: () => Promise<SandboxHandle>;
   ownerAuthCommand?: (command: string) => string;
+  scopedCommand?: (command: string) => string;
   ensureSkillTree?: (skillDir: string) => Promise<void>;
   reach?: {
     resolveChannel(query: string): Promise<ReachResolution>;
@@ -351,6 +430,9 @@ export interface ToolContextDeps {
   authorizeCommand: (command: string, approvalKey?: string) => boolean;
   grantedHandles: GrantedHandle[];
   sharedMaterializeDir?: string;
+  sandboxMigration?: SandboxMigrationRunner;
+  invalidateProvision?: () => void;
+  migrateSettleMs?: number;
   workspace: WorkspaceStore;
   deploy: DeployService;
   acl: AclStore;
@@ -369,7 +451,11 @@ export interface ToolContextDeps {
   memory?: MemoryService;
   memoryScopeId?: ScopeId;
   memoryAccess?: { write?: ScopeId; read: ScopeId[] };
-  sessionHistory?: { search(q: string, limit?: number): Promise<string[]> };
+  mcp?: McpToolService;
+  sessionHistory?: {
+    search(q: string, limit?: number): Promise<string[]>;
+    open(seq: number): Promise<string | null>;
+  };
   actingSlackUserId?: string;
   layerAuth?: {
     credentialPaths: readonly CredentialPathSpec[];
@@ -386,7 +472,9 @@ export interface ToolContextDeps {
   onGapWork?: (work: GapWork) => void;
   control?: ControlService;
   controlClaims?: CapabilityClaims;
+  webhookPublicUrl?: string;
   surface?: SurfaceToolDeps;
+  attach?: AttachFiles;
 }
 
 export function createToolContext(deps: ToolContextDeps): ToolContext {
@@ -442,7 +530,122 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     return cache ? once(call, cache) : call();
   }
 
+  const MAX_SHARED_ARTIFACT_BYTES = 10 * 1024 * 1024;
+
+  async function readGrantedArtifactBytes(ownerScopeId: ScopeId, ownerPath: string): Promise<Buffer | null> {
+    if (!deps.files) return null;
+    const rows = await deps.files.resolveByOwnerPaths([{ ownerScopeId, path: ownerPath }]);
+    // Re-assert the tuple: the (owner_scope_id, path) index isn't unique and
+    // neither implementation orders results.
+    const row = rows.find((r) => r.ownerScopeId === ownerScopeId && r.path === ownerPath);
+    if (!row) return null;
+    const opened = await deps.files.open(row.id);
+    if (!opened) return null;
+    // The advertised size can be absent on some backends (fails open at 0), so
+    // the collector enforces the cap on actual bytes read.
+    if (opened.sizeBytes > MAX_SHARED_ARTIFACT_BYTES) {
+      opened.stream.destroy();
+      throw new Error(
+        `shared file ${ownerPath.split("/").pop()} is ${opened.sizeBytes} bytes — larger than the ${MAX_SHARED_ARTIFACT_BYTES}-byte shared-read limit`,
+      );
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of opened.stream) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      total += buf.length;
+      if (total > MAX_SHARED_ARTIFACT_BYTES) {
+        opened.stream.destroy();
+        throw new Error(
+          `shared file ${ownerPath.split("/").pop()} exceeds the ${MAX_SHARED_ARTIFACT_BYTES}-byte shared-read limit`,
+        );
+      }
+      chunks.push(buf);
+    }
+    return Buffer.concat(chunks);
+  }
+
   return {
+    ...(deps.credentialExecServices ? { credentialExecServices: deps.credentialExecServices } : {}),
+    ...(deps.credentialExec ? { credentialExec: deps.credentialExec } : {}),
+    ...(deps.registerLogin ? { registerLogin: deps.registerLogin } : {}),
+    ...(deps.commandCredentials?.length
+      ? { commandCredentialHandles: deps.commandCredentials.map((credential) => credential.handle) }
+      : {}),
+    async computerStatus(): Promise<ComputerStatus> {
+      if (!deps.sandbox.computerStatus) {
+        throw new CapabilityUnsupportedError(deps.sandbox.profile.backend, "reporting computer status");
+      }
+      if (!writableScopeId) throw new Error("this turn has no scoped computer");
+      const status = await deps.sandbox.computerStatus(writableScopeId);
+      if (!status.provisioned) return status;
+      try {
+        const handle = await deps.provision();
+        const probe = await deps.sandbox.run(handle, "true", { timeoutMs: COMMAND_PATH_PROBE_TIMEOUT_MS });
+        return { ...status, guestResponsive: probe.code === 0 };
+      } catch (e) {
+        return { ...status, guestResponsive: false, probeError: errMessage(e) };
+      }
+    },
+    async restartComputer(): Promise<void> {
+      if (!deps.sandbox.restartComputer) {
+        throw new CapabilityUnsupportedError(deps.sandbox.profile.backend, "restarting the computer");
+      }
+      if (!writableScopeId) throw new Error("this turn has no scoped computer to restart");
+      await deps.sandbox.restartComputer(writableScopeId);
+    },
+    async migrateComputer(to: string): Promise<{ from: string; to: string }> {
+      const runner = deps.sandboxMigration;
+      if (!runner) throw new Error("computer migration is not available on this deployment");
+      if (!writableScopeId) throw new Error("this turn has no scoped computer to migrate");
+      const available = runner.availableBackends();
+      if (!(available as string[]).includes(to)) {
+        throw new Error(
+          `${JSON.stringify(to)} is not an available backend here — choose one of: ${available.join(", ")}`,
+        );
+      }
+      const approvalCommand = `computer:"migrate" to:"${to}"`;
+      const approvalKey = `computer-migrate:${to}`;
+      if (!deps.authorizeCommand(approvalCommand, approvalKey)) {
+        throw new NeedsApproval(
+          approvalCommand,
+          `moving this computer to ${to} re-homes its files onto a different provider and can take several minutes`,
+          "approval",
+          undefined,
+          approvalKey,
+        );
+      }
+      try {
+        const result = await runner.migrateScope(writableScopeId, to as SandboxBackendName, "agent-requested", {
+          copyTimeoutSec: 1800,
+        });
+        deps.auditLog?.record({
+          at: Date.now(),
+          principalId: deps.createdBy,
+          action: "sandbox_routes.migrate",
+          resource: `${result.from}->${result.to} sha=${result.sha.slice(0, 12)}`,
+          scopeLabel: writableScopeId,
+        });
+        await new Promise((res) => setTimeout(res, deps.migrateSettleMs ?? ROUTE_CACHE_TTL_MS));
+        deps.invalidateProvision?.();
+        return { from: result.from, to: result.to };
+      } catch (err) {
+        deps.auditLog?.record({
+          at: Date.now(),
+          principalId: deps.createdBy,
+          action: "sandbox_routes.migrate_failed",
+          resource: errMessage(err).slice(0, 200),
+          scopeLabel: writableScopeId,
+        });
+        throw new Error(
+          errMessage(err).replace(
+            "Migrate with force to accept the loss.",
+            "An operator can force this from the admin console.",
+          ),
+          { cause: err },
+        );
+      }
+    },
     async execute(
       command: string,
       execOpts?: {
@@ -451,10 +654,44 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         ownerAuth?: boolean;
         reachTarget?: string;
         signal?: AbortSignal;
+        credentials?: string[];
       },
     ): Promise<ExecResult & { reached?: ReachedProvenance }> {
       const scratch = execOpts?.scratch === true;
       const ownerAuth = execOpts?.ownerAuth === true;
+      const requestedCredentials = execOpts?.credentials ?? [];
+      if (
+        requestedCredentials.length &&
+        (scratch || ownerAuth || execOpts?.reachTarget !== undefined || !writableScopeId)
+      ) {
+        throw new Error("command credentials are available only on the scoped computer");
+      }
+      const availableCredentials = new Map(
+        (deps.commandCredentials ?? []).map((credential) => [credential.handle, credential] as const),
+      );
+      const requested = requestedCredentials.map((handle) => {
+        const credential = availableCredentials.get(handle);
+        if (!credential) throw new Error(`credential handle is not available on this turn: ${handle}`);
+        return credential;
+      });
+      const commandEnv: Record<string, string> = {};
+      for (const credential of requested) {
+        for (const { key, value } of credential.env) {
+          if (key in commandEnv && commandEnv[key] !== value) {
+            throw new Error(`requested credentials provide conflicting environment key: ${key}`);
+          }
+          commandEnv[key] = value;
+        }
+      }
+      for (const credential of requested) {
+        deps.auditLog?.record({
+          at: Date.now(),
+          principalId: deps.createdBy,
+          action: "keychain.materialize",
+          resource: `${credential.handle} (command)`,
+          scopeLabel: writableScopeId!,
+        });
+      }
       const reachTarget = execOpts?.reachTarget;
       if ([scratch, ownerAuth, reachTarget !== undefined].filter(Boolean).length > 1) {
         throw new Error("a command runs on one computer — choose scoped, scratch, owner, or a reached room");
@@ -519,8 +756,13 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           });
         }
         return timed("exec", async () => {
-          const sandboxCommand = ownerAuth && deps.ownerAuthCommand ? deps.ownerAuthCommand(command) : command;
-          const r = await deps.sandbox.run(handle, sandboxCommand, opts);
+          const sandboxCommand = ownerAuth
+            ? (deps.ownerAuthCommand?.(command) ?? command)
+            : (deps.scopedCommand?.(command) ?? command);
+          const commandHandle = Object.keys(commandEnv).length
+            ? { ...handle, env: { ...handle.env, ...commandEnv } }
+            : handle;
+          const r = await deps.sandbox.run(commandHandle, sandboxCommand, opts);
           return reached ? { ...r, reached } : r;
         });
       });
@@ -544,10 +786,17 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           };
         }
         const granted = matches[0]!;
-        const bytes = await deps.workspace.readBytes(granted.ownerScopeId, granted.ownerPath);
+        // Two producers create grants: the write tool (workspace-backed, real
+        // workspace path) and viewer uploads / inbound attachments (artifact
+        // store only, artifacts/<id>/<name>). The namespace decides which
+        // store serves the read — never a precedence rule, because a
+        // workspace-backed path can also have a stale artifact snapshot.
+        const bytes = isArtifactPath(granted.ownerPath)
+          ? await readGrantedArtifactBytes(granted.ownerScopeId, granted.ownerPath)
+          : await deps.workspace.readBytes(granted.ownerScopeId, granted.ownerPath);
         if (bytes === null) return { content: null, sourceScopeId: granted.ownerScopeId };
         const asText = tryDecodeUtf8(bytes);
-        if (asText !== null) return { content: asText, sourceScopeId: granted.ownerScopeId };
+        if (asText !== null) return { content: asText, sourceScopeId: granted.ownerScopeId, shared: true };
         const handle = await deps.provision();
         const name = granted.handlePath.split(/[\\/]/).pop() ?? granted.handlePath;
         const materializedPath = deps.sharedMaterializeDir
@@ -559,6 +808,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
             `[binary file materialized into the sandbox at ${materializedPath} (${bytes.length} bytes) — ` +
             `to send it, attach it to a message: name \`${materializedPath}\` in the surface \`post\` action's \`files\`]`,
           sourceScopeId: granted.ownerScopeId,
+          shared: true,
         };
       }
       const skillDir = skillTreeDirFor(path);
@@ -573,6 +823,17 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         }
         return { content: null, sourceScopeId: null };
       });
+    },
+
+    async createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact> {
+      if (!deps.files || !writableScopeId) throw new Error("playgrounds require a writable artifact store");
+      return once(() =>
+        createPlaygroundArtifact(deps.files!, {
+          ...input,
+          ownerScopeId: writableScopeId,
+          createdBy: deps.createdBy,
+        }),
+      );
     },
 
     async write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult> {
@@ -655,23 +916,35 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       if (!writableScopeId) throw new Error("publish needs a writable scope to own the app");
       const owner: ScopeId = scopeId("personal", deps.createdBy);
       const createdInScope: ScopeId = writableScopeId;
-      if (input.entrypoint && input.dir && hasParentPathSegment(input.dir)) {
+      let effectiveEntrypoint = input.entrypoint;
+      if (effectiveEntrypoint === undefined && input.rollbackTo === undefined) {
+        const shouldInheritForRename = input.renameFrom !== undefined && input.dir !== undefined;
+        const priorName =
+          input.renameFrom === undefined || shouldInheritForRename ? (input.renameFrom ?? input.name) : undefined;
+        const prior = priorName ? await deps.deploy.getDeployment(priorName) : null;
+        effectiveEntrypoint = deploymentEntrypoint(prior);
+        if (!effectiveEntrypoint && input.renameFrom === undefined) {
+          throw new Error('publish requires an entrypoint, e.g. "node server.js"');
+        }
+      }
+      if (effectiveEntrypoint && input.dir && hasParentPathSegment(input.dir)) {
         throw new Error("publish directory must stay inside the workspace — no .. path segments");
       }
       const handle = await deps.provision();
-      const files: DeployFile[] = input.entrypoint
+      const files: DeployFile[] = effectiveEntrypoint
         ? filesUnder(await collectTree(deps.sandbox, handle, input.dir), input.dir)
         : [];
-      if (input.entrypoint && files.length === 0) {
+      if (effectiveEntrypoint && files.length === 0) {
         throw new Error(`publish: no files found under ${input.dir ?? "."} - nothing to deploy`);
       }
-      const { authEnv } = input.entrypoint
-        ? await captureResidentAuth(deps.sandbox, handle, {
-            split: true,
-            ...(deps.actingSlackUserId ? { actingSlackUserId: deps.actingSlackUserId } : {}),
-            ...(deps.layerAuth ? { layerAuth: deps.layerAuth } : {}),
-          })
-        : { authEnv: {} };
+      const authEnv = effectiveEntrypoint
+        ? Object.assign(
+            {},
+            ...(deps.layerAuth?.splitEnvTemplates ?? []).map((template) =>
+              interpolateSplitEnv(template, { actingSlackUserId: deps.actingSlackUserId }),
+            ),
+          )
+        : {};
       const env = { ...input.env, ...authEnv };
 
       const pc = deps.publishContext;
@@ -688,7 +961,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           : { kind: "owner", grantees: [] };
       const optOut = Array.isArray(input.share) && input.share.length === 0;
       const desiredDefault = optOut ? [] : aud.grantees;
-      const doReconcile = input.entrypoint !== undefined && (optOut || !aud.incomplete);
+      const doReconcile = effectiveEntrypoint !== undefined && (optOut || !aud.incomplete);
       const snapshotAt = Date.now();
       const resolvedShare = input.share?.map((s) => {
         const scope = s.scope === "org" ? orgScopeId : s.scope;
@@ -709,6 +982,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           ...(input.renameFrom !== undefined ? { renameFrom: input.renameFrom } : {}),
           ...(Object.keys(env).length ? { env } : {}),
           ...(input.rollbackTo !== undefined ? { rollbackTo: input.rollbackTo } : {}),
+          ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
           ...(doReconcile
             ? {
                 defaultAudience: {
@@ -728,12 +1002,12 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           d.createdInScope,
         );
         const audience: PublishAudienceDescriptor =
-          aud.incomplete && input.entrypoint !== undefined && input.share === undefined && aud.reason
+          aud.incomplete && effectiveEntrypoint !== undefined && input.share === undefined && aud.reason
             ? { ...base, note: aud.reason }
             : base;
         const urlBase = deps.publicWebUrl?.replace(/\/$/, "") ?? "";
         const url = publicUrlOf(d.endpoint) ?? `${urlBase}/d/${ref}/`;
-        const dataDir = input.entrypoint ? deps.deploy.providerProfile?.dataDir : undefined;
+        const dataDir = effectiveEntrypoint ? deps.deploy.providerProfile?.dataDir : undefined;
         return {
           id: d.id,
           ...(d.name ? { name: d.name } : {}),
@@ -741,6 +1015,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           url,
           audience,
           ...(dataDir ? { dataDir } : {}),
+          ...(d.alwaysOn ? { alwaysOn: true } : {}),
         };
       });
     },
@@ -751,7 +1026,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       return timed("recall", async () => {
         const out: string[] = [];
         for (const scope of read) {
-          for (const fact of await deps.memory!.query(scope, q, limit)) {
+          for (const fact of await deps.memory!.query(scope, q, limit, { actorId: deps.createdBy })) {
             out.push(read.length > 1 ? `[${scope}] ${fact}` : fact);
           }
         }
@@ -768,7 +1043,11 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     async memoryRemember(facts: string[]): Promise<number | null> {
       const write = deps.memoryAccess?.write;
       if (!deps.memory || !write) return null;
-      return once(() => timed("memory_write", () => deps.memory!.capture(write, facts, Date.now(), deps.createdBy)));
+      return once(() =>
+        timed("memory_write", () =>
+          deps.memory!.capture(write, facts, Date.now(), deps.createdBy, { mode: "explicit", actorId: deps.createdBy }),
+        ),
+      );
     },
 
     async memoryRewrite(content: string): Promise<true | null> {
@@ -787,6 +1066,20 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       return deps.sessionHistory.search(q, limit);
     },
 
+    async historyOpen(seq: number): Promise<string | null> {
+      if (!deps.sessionHistory) return null;
+      return deps.sessionHistory.open(seq);
+    },
+
+    mcpToolDefs(): McpToolDescriptor[] {
+      return deps.mcp?.toolDefs() ?? [];
+    },
+
+    async callMcpTool(name: string, args: Record<string, unknown>): Promise<string> {
+      if (!deps.mcp) throw new Error("no MCP connectors are configured");
+      return deps.mcp.call(name, args, deps.createdBy);
+    },
+
     async backgroundStart(command: string, opts?: { ttlSeconds?: number }): Promise<BackgroundStartResult> {
       if (!deps.backgroundBroker) throw new Error(BACKGROUND_UNAVAILABLE_MESSAGE);
       const handle = await deps.provision();
@@ -803,7 +1096,12 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         for (const skillDir of skillTreeDirsInCommand(command)) await deps.ensureSkillTree(skillDir);
       }
       return once(
-        () => deps.backgroundBroker!.start(handle, command, opts?.ttlSeconds ? opts.ttlSeconds * 1000 : undefined),
+        () =>
+          deps.backgroundBroker!.start(
+            handle,
+            deps.scopedCommand?.(command) ?? command,
+            opts?.ttlSeconds ? opts.ttlSeconds * 1000 : undefined,
+          ),
         () => true,
       );
     },
@@ -877,6 +1175,11 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         (c, cl) => c.patchCron(id, req, cl),
         (r) => r.ok,
       ),
+    cronNote: (id, note) =>
+      controlOp(
+        (c, cl) => c.noteCron(id, note, cl),
+        (r) => r.ok,
+      ),
     cronDelete: (id) =>
       controlOp(
         (c, cl) => c.deleteCron(id, cl),
@@ -895,6 +1198,17 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     cronRetarget: (id, destinationKey) =>
       controlOp(
         (c, cl) => c.retargetCron(id, destinationKey, cl),
+        (r) => r.ok,
+      ),
+    webhookCreate: (req) =>
+      controlOp(
+        (c, cl) => c.createWebhook(req, cl, deps.webhookPublicUrl),
+        (r) => r.ok,
+      ),
+    webhookList: () => controlOp((c, cl) => c.listWebhooks(cl)),
+    webhookDisable: (id) =>
+      controlOp(
+        (c, cl) => c.disableWebhook(id, cl),
         (r) => r.ok,
       ),
     soulRead() {
@@ -943,13 +1257,19 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     readMembers: () => surfaceOp((s) => s.readMembers()),
     readFile: (ref) => surfaceOp((s) => s.readFile(ref)),
     getStandingOrder: () => surfaceOp((s) => s.getStandingOrder()),
-    setStandingOrder: (orders, bots) => surfaceOp((s) => s.setStandingOrder(orders, bots)),
+    setStandingOrder: (orders, bots, ambientEnabled) =>
+      surfaceOp((s) => s.setStandingOrder(orders, bots, ambientEnabled)),
     staySilent: (reason) =>
       deps.surface
         ? deps.surface.staySilent(reason)
         : Promise.resolve({ ok: true as const, message: "[staying silent]" }),
+    attach: (files) =>
+      deps.attach ? deps.attach(files) : Promise.resolve({ ok: false as const, message: ATTACH_UNAVAILABLE_MESSAGE }),
   };
 }
+
+const ATTACH_UNAVAILABLE_MESSAGE =
+  "files can't be attached from this turn — name the file in the surface `post` action's `files` instead";
 
 const SURFACE_UNAVAILABLE_MESSAGE =
   "the chat surface isn't reachable from this turn — there's no conversation to post to or read here";
@@ -982,50 +1302,7 @@ function tryDecodeUtf8(bytes: Uint8Array): string | null {
   }
 }
 
-const RESIDENT_AUTH_PATHS = BASE_RESIDENT_AUTH_PATHS;
-
-function isResidentAuthPath(path: string, paths: readonly string[] = RESIDENT_AUTH_PATHS): boolean {
-  const p = path.replace(/^\.?\/+/, "");
-  return paths.some((a) => p === a || p.startsWith(`${a}/`));
-}
-
-async function captureResidentAuth(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
-  opts: {
-    split: boolean;
-    actingSlackUserId?: string;
-    layerAuth?: {
-      credentialPaths: readonly CredentialPathSpec[];
-      splitEnvTemplates: ReadonlyArray<Record<string, string>>;
-    };
-  },
-): Promise<{ homeFiles: DeployFile[]; authEnv: Record<string, string> }> {
-  if (opts.split) {
-    const authEnv: Record<string, string> = {};
-    for (const template of opts.layerAuth?.splitEnvTemplates ?? []) {
-      Object.assign(
-        authEnv,
-        interpolateSplitEnv(template, opts.actingSlackUserId ? { actingSlackUserId: opts.actingSlackUserId } : {}),
-      );
-    }
-    return { homeFiles: [], authEnv };
-  }
-  if (!supportsAgentComputerBackup(sandbox)) return { homeFiles: [], authEnv: {} };
-  const authPaths = residentAuthPaths(opts.layerAuth?.credentialPaths);
-  try {
-    const entries = await sandbox.backupComputer(handle, {
-      include: ["home"],
-      includePaths: authPaths,
-      exclude: (e) => e.area !== "home" || !isResidentAuthPath(e.path, authPaths),
-      followSymlinks: true,
-    });
-    return { homeFiles: entries.map((e) => ({ path: e.path, data: e.data })), authEnv: {} };
-  } catch (e) {
-    if (e instanceof CapabilityUnsupportedError) return { homeFiles: [], authEnv: {} };
-    throw e;
-  }
-}
+const COMMAND_PATH_PROBE_TIMEOUT_MS = 15_000;
 
 async function collectTree(
   sandbox: Sandbox,
@@ -1033,9 +1310,9 @@ async function collectTree(
   dir?: string,
 ): Promise<Array<{ path: string; data: Uint8Array }>> {
   const base = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
-  if (supportsAgentComputerBackup(sandbox)) {
+  if (supportsAgentComputerExport(sandbox)) {
     try {
-      const entries = await sandbox.backupComputer(handle, {
+      const entries = await sandbox.exportFiles(handle, {
         include: ["workspace"],
         ...(base && base !== "." ? { includePaths: [base] } : {}),
         exclude: (entry) => carriesGitMetadata(entry.path),
@@ -1044,6 +1321,7 @@ async function collectTree(
       return entries.filter((e) => !carriesGitMetadata(e.path)).map((e) => ({ path: e.path, data: e.data }));
     } catch (e) {
       if (!(e instanceof CapabilityUnsupportedError)) throw e;
+      console.warn(`[publish] ${e.message}; falling back to per-file reads`);
     }
   }
   const out: Array<{ path: string; data: Uint8Array }> = [];

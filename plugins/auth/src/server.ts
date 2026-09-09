@@ -1,9 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { readBody, PayloadTooLargeError, serveEmojiFavicon } from "../../chassis/src/http.ts";
+import { readBody, PayloadTooLargeError, sendBuffered, serveEmojiFavicon } from "../../chassis/src/http.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
 import type { AuthConfig } from "./config.ts";
 import { validEmail } from "./config.ts";
-import { claimOnce, withinRateLimit, type ClaimStore } from "../../chassis/src/claims.ts";
+import { claimOnce, withinRateLimit, ClaimStoreUnavailableError, type ClaimStore } from "../../chassis/src/claims.ts";
+import { coreEmailAllowed } from "../../chassis/src/external-members.ts";
 import { mintIdToken, pkceMatches, safeEqual, subjectFor, TokenSigner, type AuthRequest } from "./tokens.ts";
 import { ID_TOKEN_ALG, type SigningKey } from "./keys.ts";
 import { renderSignInEmail, type Mailer } from "./email.ts";
@@ -18,14 +19,11 @@ export interface AuthDeps {
   signingKey: SigningKey;
   signer: TokenSigner;
   claims: ClaimStore;
-  mailer: Mailer;
+  mailer: Mailer | null;
+  brandName?: () => string;
+  emailAllowed?: (email: string) => Promise<boolean>;
   now?: () => number;
   onBackgroundTask?: (task: Promise<void>) => void;
-}
-
-function emailAllowed(cfg: AuthConfig, email: string): boolean {
-  if (cfg.allowedEmails.includes(email)) return true;
-  return Boolean(cfg.allowedEmailDomain) && email.endsWith(`@${cfg.allowedEmailDomain}`);
 }
 
 function normalizeEmail(raw: string): string {
@@ -49,21 +47,17 @@ function noStore(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, noStore({ "content-type": "application/json" }));
-  res.end(JSON.stringify(body));
+  sendBuffered(res, status, noStore({ "content-type": "application/json" }), JSON.stringify(body));
 }
 
 function sendHtml(res: ServerResponse, status: number, html: string, csp = PAGE_CSP): void {
-  res.writeHead(
-    status,
-    noStore({
-      "content-type": "text/html; charset=utf-8",
-      "content-security-policy": csp,
-      "x-frame-options": "DENY",
-      "x-robots-tag": "noindex, nofollow",
-    }),
-  );
-  res.end(html);
+  const headers = noStore({
+    "content-type": "text/html; charset=utf-8",
+    "content-security-policy": csp,
+    "x-frame-options": "DENY",
+    "x-robots-tag": "noindex, nofollow",
+  });
+  sendBuffered(res, status, headers, html);
 }
 
 function basicCredentials(header: string | undefined): { id: string; secret: string } | null {
@@ -102,6 +96,14 @@ function readAuthorizeRequest(
 
 export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   const { cfg, signer, claims, mailer, signingKey } = deps;
+  const brandName = deps.brandName ?? ((): string => cfg.brandName);
+  const invited =
+    deps.emailAllowed ??
+    ((email: string): Promise<boolean> => coreEmailAllowed(cfg.coreApiUrl, cfg.coreSigningSecret, email, "auth"));
+  const emailAllowed = async (email: string): Promise<boolean> =>
+    cfg.allowedEmails.includes(email) ||
+    (Boolean(cfg.allowedEmailDomain) && email.endsWith(`@${cfg.allowedEmailDomain}`)) ||
+    invited(email);
   const now = deps.now ?? Date.now;
   const notify = deps.onBackgroundTask ?? ((task: Promise<void>) => void task.catch(() => undefined));
   const formAction = `${cfg.publicPath}/authorize`;
@@ -121,7 +123,15 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
   };
 
   const problem = (res: ServerResponse, status: number, heading: string, msg: string, detail?: string): void =>
-    sendHtml(res, status, problemPage({ brandName: cfg.brandName, heading, msg, ...(detail ? { detail } : {}) }));
+    sendHtml(res, status, problemPage({ brandName: brandName(), heading, msg, ...(detail ? { detail } : {}) }));
+
+  const emailUnavailable = (res: ServerResponse): void =>
+    problem(
+      res,
+      503,
+      "Email delivery isn't configured",
+      "Your administrator needs to configure email delivery before you can request a sign-in link.",
+    );
 
   const signInUrl = ((): string | undefined => {
     try {
@@ -136,7 +146,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       res,
       400,
       problemPage({
-        brandName: cfg.brandName,
+        brandName: brandName(),
         heading: "This sign-in link no longer works",
         msg: "Sign-in links work once and expire quickly. Request a fresh one and open it right away.",
         ...(signInUrl ? { retryUrl: signInUrl } : {}),
@@ -153,35 +163,44 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         "Start again from the page you were trying to reach.",
         parsed.problem,
       );
+    if (!mailer) return emailUnavailable(res);
     const sealed = await signer.sealRequest(parsed.request, cfg.requestTtlS, now());
     return sendHtml(
       res,
       200,
-      emailFormPage({ brandName: cfg.brandName, action: formAction, requestToken: sealed.token }),
+      emailFormPage({ brandName: brandName(), action: formAction, requestToken: sealed.token }),
     );
   }
 
-  async function sendLink(request: AuthRequest, email: string, ip: string): Promise<void> {
+  async function sendLink(request: AuthRequest, email: string, ip: string, sender: Mailer): Promise<void> {
     const nowMs = now();
     const within = async (kind: string, value: string, limit: number): Promise<boolean> =>
       withinRateLimit(claims, { secret: cfg.tokenSecret, kind, value, limit, windowS: cfg.sendWindowS, nowMs });
-    if (!emailAllowed(cfg, email)) {
+    if (!(await emailAllowed(email))) {
       console.warn(`[auth] sign-in link suppressed: ${email} is not on the permitted list`);
       return;
     }
-    if (!(await within("ip", ip, cfg.sendLimitPerIp))) {
-      console.warn("[auth] sign-in link suppressed: per-address rate limit reached for the requesting client");
-      return;
-    }
-    if (!(await within("mailbox", email, cfg.sendLimitPerEmail))) {
-      console.warn("[auth] sign-in link suppressed: per-mailbox rate limit reached");
+    try {
+      if (!(await within("ip", ip, cfg.sendLimitPerIp))) {
+        console.warn("[auth] sign-in link suppressed: per-address rate limit reached for the requesting client");
+        return;
+      }
+      if (!(await within("mailbox", email, cfg.sendLimitPerEmail))) {
+        console.warn("[auth] sign-in link suppressed: per-mailbox rate limit reached");
+        return;
+      }
+    } catch (e) {
+      if (!(e instanceof ClaimStoreUnavailableError)) throw e;
+      console.error(
+        "[auth] sign-in link suppressed: core is unreachable, so rate limits cannot be enforced — sign-in fails closed until core is healthy (this is a core outage, not a rate limit)",
+      );
       return;
     }
     const sealed = await signer.sealLink({ ...request, email }, cfg.linkTtlS, nowMs);
     const link = `${cfg.issuer}/verify#token=${encodeURIComponent(sealed.token)}`;
     try {
-      const receipt = await mailer.send(
-        renderSignInEmail({ to: email, brandName: cfg.brandName, link, ttlMinutes: linkTtlMinutes }),
+      const receipt = await sender.send(
+        renderSignInEmail({ to: email, brandName: brandName(), link, ttlMinutes: linkTtlMinutes }),
       );
       console.log(`[auth] sign-in link sent to ${email} (${receipt})`);
     } catch (e) {
@@ -190,6 +209,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
   }
 
   async function authorizeSubmit(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!mailer) return emailUnavailable(res);
     let raw: string;
     try {
       raw = await readBody(req, MAX_FORM_BYTES);
@@ -215,7 +235,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         res,
         400,
         emailFormPage({
-          brandName: cfg.brandName,
+          brandName: brandName(),
           action: formAction,
           requestToken: sealed.token,
           problem: "That doesn't look like an email address.",
@@ -223,15 +243,15 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
       );
     }
     const ip = clientIpOf(req);
-    sendHtml(res, 200, linkSentPage({ brandName: cfg.brandName, email, ttlMinutes: linkTtlMinutes }));
-    background(() => sendLink(request, email, ip));
+    sendHtml(res, 200, linkSentPage({ brandName: brandName(), email, ttlMinutes: linkTtlMinutes }));
+    background(() => sendLink(request, email, ip, mailer));
   }
 
   function confirmVerify(res: ServerResponse): void {
     return sendHtml(
       res,
       200,
-      confirmSignInPage({ brandName: cfg.brandName, action: `${cfg.publicPath}/verify` }),
+      confirmSignInPage({ brandName: brandName(), action: `${cfg.publicPath}/verify` }),
       CONFIRM_PAGE_CSP,
     );
   }
@@ -245,7 +265,19 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     }
     const opened = await signer.openLink(new URLSearchParams(raw).get("token") ?? "", now());
     if (!opened) return staleLink(res);
-    if (!(await claimOnce(claims, `link:${opened.jti}`, opened.expiresAtMs))) return staleLink(res);
+    let linkClaimed: boolean;
+    try {
+      linkClaimed = await claimOnce(claims, `link:${opened.jti}`, opened.expiresAtMs);
+    } catch (e) {
+      if (!(e instanceof ClaimStoreUnavailableError)) throw e;
+      return problem(
+        res,
+        503,
+        "Sign-in is temporarily unavailable",
+        "The sign-in service cannot reach its backend. Try again in a minute — this link stays valid.",
+      );
+    }
+    if (!linkClaimed) return staleLink(res);
     const { claims: link } = opened;
     if (!safeEqual(link.clientId, cfg.clientId) || !safeEqual(link.redirectUri, cfg.redirectUri)) {
       return problem(
@@ -255,7 +287,7 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
         "The sign-in configuration changed after this link was sent. Start again.",
       );
     }
-    if (!emailAllowed(cfg, link.email)) {
+    if (!(await emailAllowed(link.email))) {
       return problem(res, 403, "This address can't sign in", "Your administrator has not allowed this email address.");
     }
     const code = await signer.sealCode(
@@ -303,11 +335,17 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     ) {
       return sendJson(res, 400, { error: "invalid_grant" });
     }
-    if (!(await claimOnce(claims, `code:${opened.jti}`, opened.expiresAtMs)))
-      return sendJson(res, 400, { error: "invalid_grant" });
+    let codeClaimed: boolean;
+    try {
+      codeClaimed = await claimOnce(claims, `code:${opened.jti}`, opened.expiresAtMs);
+    } catch (e) {
+      if (!(e instanceof ClaimStoreUnavailableError)) throw e;
+      return sendJson(res, 503, { error: "temporarily_unavailable" });
+    }
+    if (!codeClaimed) return sendJson(res, 400, { error: "invalid_grant" });
     if (!pkceMatches(form.get("code_verifier") ?? "", granted.codeChallenge))
       return sendJson(res, 400, { error: "invalid_grant" });
-    if (!emailAllowed(cfg, granted.email)) return sendJson(res, 400, { error: "invalid_grant" });
+    if (!(await emailAllowed(granted.email))) return sendJson(res, 400, { error: "invalid_grant" });
 
     const nowMs = now();
     const sub = subjectFor(cfg.issuer, granted.email);
@@ -371,6 +409,15 @@ export function createAuthHandler(deps: AuthDeps): (req: IncomingMessage, res: S
     const path = url.pathname;
 
     if (method === "GET" && path === "/healthz") return sendJson(res, 200, { ok: true });
+    if (method === "GET" && path === "/readyz") {
+      try {
+        const r = await fetch(`${cfg.coreApiUrl}/healthz`, { signal: AbortSignal.timeout(2_000) });
+        if (r.ok) return sendJson(res, 200, { ok: true });
+        return sendJson(res, 503, { ok: false, core: `HTTP ${r.status}` });
+      } catch (e) {
+        return sendJson(res, 503, { ok: false, core: errMessage(e) });
+      }
+    }
     if (method === "GET" && (path === "/favicon.ico" || path === "/favicon.svg")) {
       return serveEmojiFavicon(res, "✉️", "max-age=86400");
     }

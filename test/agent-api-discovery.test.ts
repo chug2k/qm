@@ -36,7 +36,11 @@ async function start() {
 
 const capFor = (
   actorId: string,
-  opts: { memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] }; liveActor?: boolean } = {},
+  opts: {
+    memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] };
+    liveActor?: boolean;
+    grants?: string[];
+  } = {},
 ) =>
   mintCapabilityToken(
     {
@@ -45,6 +49,7 @@ const capFor = (
       exp: Date.now() + CAPABILITY_TTL_MS,
       ...(opts.memory ? { memory: opts.memory } : {}),
       ...(opts.liveActor ? { liveActor: true } : {}),
+      ...(opts.grants ? { grants: opts.grants } : {}),
     },
     SECRET,
   );
@@ -64,7 +69,7 @@ test("discovery for a regular user: base surface + whoami, no admin rows, no mem
     const p = paths(body);
     assert.ok(p.includes("/v1/apis"));
     assert.ok(!p.includes("/v1/crons"), "cron is a typed tool now, not a discovery row");
-    assert.ok(!p.includes("/v1/webhooks"), "webhooks are gone");
+    assert.ok(!p.includes("/v1/webhooks"), "webhook is a typed tool now, not a discovery row");
     assert.ok(!p.includes("/v1/soul"), "soul is a typed tool now, not a discovery row");
     assert.ok(p.includes("/v1/skills"), "saving a personal skill is a discoverable self-API endpoint");
     assert.ok(p.includes("/v1/keychain/overview"), "the keychain overview gate is represented in discovery");
@@ -75,6 +80,10 @@ test("discovery for a regular user: base surface + whoami, no admin rows, no mem
     assert.match(
       body.endpoints.find((endpoint: any) => endpoint.path === "/v1/connectors/oauth/consent/mint")?.summary ?? "",
       /stays private.*explicit credential grant/i,
+    );
+    assert.match(
+      body.endpoints.find((endpoint: any) => endpoint.path === "/v1/loops")?.summary ?? "",
+      /governor.*staleFireMs/,
     );
   } finally {
     await s.close();
@@ -131,6 +140,25 @@ test("an admin's AUTONOMOUS turn (no liveActor) is shown no admin plane — matc
   }
 });
 
+test("a granted autonomous turn discovers only the unattended read family", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(s.base, await capFor("admin-alice", { grants: ["admin.sessions.read"] }));
+    const adminPaths = paths(body).filter((path) => path.startsWith("/v1/admin/"));
+    assert.deepEqual(adminPaths, [
+      "/v1/admin/sessions",
+      "/v1/admin/sessions/:id",
+      "/v1/admin/scopes",
+      "/v1/admin/errors",
+      "/v1/admin/runs",
+      "/v1/admin/whoami",
+    ]);
+    assert.ok(body.guidance.some((guidance: string) => guidance.includes("flag any other admin action")));
+  } finally {
+    await s.close();
+  }
+});
+
 test("discovery requires a capability token", async () => {
   const s = await start();
   try {
@@ -173,6 +201,9 @@ test("the catalog IS the gate: discovery rows with real paths are admitted, unli
   assert.equal(agentApiMatches("GET", "/v1/skills/abc"), true);
   assert.equal(agentApiMatches("POST", "/v1/skills/abc/restore"), true);
   assert.equal(agentApiMatches("GET", "/v1/crons/abc"), true);
+  assert.equal(agentApiMatches("POST", "/v1/crons/abc/note"), true);
+  assert.equal(agentApiMatches("GET", "/v1/crons/abc/note"), false, "note is POST-only");
+  assert.equal(agentApiMatches("POST", "/v1/webhooks/abc/enable"), true);
   assert.equal(agentApiMatches("PUT", "/v1/memory/self"), true);
   assert.equal(agentApiMatches("PUT", "/v1/admin/memory"), true);
   assert.equal(agentApiMatches("GET", "/v1/admin/whoami"), true);
@@ -183,5 +214,5 @@ test("the catalog IS the gate: discovery rows with real paths are admitted, unli
   );
   assert.equal(agentApiMatches("POST", "/v1/turns"), false, "turn ingress stays source-auth only");
   assert.equal(agentApiMatches("GET", "/v1/sessions/abc"), false);
-  assert.equal(agentApiMatches("POST", "/v1/webhooks"), false, "webhooks are gone");
+  assert.equal(agentApiMatches("DELETE", "/v1/webhooks"), false);
 });

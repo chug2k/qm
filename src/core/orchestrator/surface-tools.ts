@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   Conversation,
   DeliveryProvenance,
@@ -21,18 +20,19 @@ import { hasParentPathSegment, type SandboxHandle } from "../../sandbox/sandbox.
 import type {
   SurfaceToolDeps,
   SurfacePostResult,
+  PostedFileMeta,
   SurfaceReactInput,
   SurfaceEditInput,
   SurfaceDeleteInput,
   SurfaceSearchResult,
 } from "../../tools/primitives.ts";
-import { collectBlob, type BlobTransferStore } from "../../persistence/blob-transfer.ts";
+import { collectBlob, MAX_BLOB_BYTES, type BlobTransferStore } from "../../persistence/blob-transfer.ts";
 import { collectNamedOutbound, type ArtifactRegistration } from "../attachments.ts";
 import { parseBotLedger, type BotPolicy } from "../../surface-cache/channel-policy-store.ts";
 import { isoFromTs } from "../../util/message-tag.ts";
 import { errMessage } from "../../util/errors.ts";
-import { orgId } from "../../config.ts";
-import { headLooksLikeText, replaceThreadSegment } from "./turn-helpers.ts";
+import { adminSessionUrl } from "../../util/admin-links.ts";
+import { headLooksLikeText, replaceThreadSegment, type TurnPostKeys } from "./turn-helpers.ts";
 import type { OrchestratorDeps, OrchestratorInput } from "./types.ts";
 
 const SURFACE_READ_DEFAULT = 100;
@@ -61,7 +61,17 @@ export interface SurfaceToolsContext {
   fileRegistration: ArtifactRegistration;
   provision: () => Promise<SandboxHandle>;
   postProvenance: (deliveryKey: string) => DeliveryProvenance;
+  postKeys: TurnPostKeys;
   spine: SpineState;
+}
+
+function postedFileMetas(attachments: readonly OutgoingAttachment[]): PostedFileMeta[] {
+  return attachments.map((a) => ({
+    name: a.name,
+    mimetype: a.mimetype,
+    sizeBytes: a.sizeBytes,
+    ...(a.artifactId ? { artifactId: a.artifactId } : {}),
+  }));
 }
 
 export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps | undefined {
@@ -78,6 +88,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
     fileRegistration,
     provision,
     postProvenance,
+    postKeys,
     spine,
   } = ctx;
   if (strictReadOnly || !(input.surfaceTools && defaultDestination && deps.deliveries)) return undefined;
@@ -138,10 +149,11 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
   const enqueue = async (
     destination: Destination,
     postText: string,
+    seq: number,
     attachments?: OutgoingAttachment[],
   ): Promise<SurfacePostResult> => {
     try {
-      const idempotencyKey = `post:${session.id}:${randomUUID()}`;
+      const idempotencyKey = postKeys.key(destination, seq);
       const delivery = await reachEnqueue({
         deliveries,
         destination,
@@ -159,8 +171,8 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
   };
   const buildDebugFooter = (): string | undefined => {
     if (!deps.surfaceDebugFooter || !deps.publicWebUrl) return undefined;
-    const base = `${deps.publicWebUrl.replace(/\/$/, "")}/admin/history?scope=${encodeURIComponent(`org:${orgId()}`)}&session=${encodeURIComponent(session.id)}`;
-    const contextUrl = spine.turnUserEntrySeq !== undefined ? `${base}&turn=${spine.turnUserEntrySeq}` : base;
+    const base = adminSessionUrl(deps.publicWebUrl, session.id);
+    const contextUrl = spine.turnUserEntrySeq !== undefined ? `${base}?turn=${spine.turnUserEntrySeq}` : base;
     return `<${base}|session>   <${contextUrl}|context>`;
   };
   let coverageChecked = false;
@@ -197,6 +209,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
   };
   return {
     post: async (postText, opts, files) => {
+      const seq = postKeys.take();
       let destination = currentDestination;
       if (opts?.ts && destination.type !== "principal") {
         destination = { ...destination, target: replaceThreadSegment(destination.target, opts.ts) };
@@ -217,9 +230,11 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         ...(taskList?.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
         ...(footer ? { debugFooter: footer } : {}),
       };
-      return enqueue(projectedDestination, postText, f.attachments);
+      const sent = await enqueue(projectedDestination, postText, seq, f.attachments);
+      return sent.ok && f.attachments?.length ? { ...sent, attachments: postedFileMetas(f.attachments) } : sent;
     },
     reach: async (postText, target, files) => {
+      const seq = postKeys.take();
       if (spine.crossConversationPosts >= 5) return { ok: false, message: "outbound limit reached for this turn" };
       const selectors = [
         target.channel !== undefined,
@@ -233,8 +248,9 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       const sending = postText.trim().length > 0 || (f.attachments?.length ?? 0) > 0;
       const d = await resolveDestination(target, { mayOpenGroup: sending });
       if (!d.ok) return { ok: false, message: d.message };
-      const r = await enqueue(d.destination, postText, f.attachments);
-      if (!r.ok) return r;
+      const r0 = await enqueue(d.destination, postText, seq, f.attachments);
+      if (!r0.ok) return r0;
+      const r = f.attachments?.length ? { ...r0, attachments: postedFileMetas(f.attachments) } : r0;
       spine.crossConversationPosts += 1;
       let label = `a group DM (${target.participants?.length ?? 0} people)`;
       if (target.channel !== undefined) label = `#${target.channel.replace(/^#/, "")}`;
@@ -242,6 +258,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       return { ...r, matched: label };
     },
     react: async (input: SurfaceReactInput) => {
+      const seq = postKeys.take();
       const d = await resolveDestination({
         ...(input.channel !== undefined ? { channel: input.channel } : {}),
         ...(input.participants !== undefined ? { participants: input.participants } : {}),
@@ -249,23 +266,25 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       if (!d.ok) return { ok: false, message: d.message };
       if (d.destination.type === "principal")
         return { ok: false, message: "I can only react to a message in a channel, group DM, or this conversation." };
-      return enqueue(withReact(d.destination, { messageTs: input.ts, emoji: input.emoji }), "");
+      return enqueue(withReact(d.destination, { messageTs: input.ts, emoji: input.emoji }), "", seq);
     },
     edit: async (input: SurfaceEditInput) => {
+      const seq = postKeys.take();
       const d = await resolveDestination({
         ...(input.channel !== undefined ? { channel: input.channel } : {}),
         ...(input.participants !== undefined ? { participants: input.participants } : {}),
       });
       if (!d.ok) return { ok: false, message: d.message };
-      return enqueue(withEdit(d.destination, input.ref), input.text);
+      return enqueue(withEdit(d.destination, input.ref), input.text, seq);
     },
     delete: async (input: SurfaceDeleteInput) => {
+      const seq = postKeys.take();
       const d = await resolveDestination({
         ...(input.channel !== undefined ? { channel: input.channel } : {}),
         ...(input.participants !== undefined ? { participants: input.participants } : {}),
       });
       if (!d.ok) return { ok: false, message: d.message };
-      return enqueue(withDelete(d.destination, { messageTs: input.ref }), "");
+      return enqueue(withDelete(d.destination, { messageTs: input.ref }), "", seq);
     },
     readThread: async (opts?: { limit?: number }) => {
       if (!deps.surfaceContext) return { ok: false, message: "the surface can't be read from this turn" };
@@ -404,6 +423,13 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         return { ok: false, message: errMessage(e) };
       }
       if (!blob) return { ok: false, message: "I can't find that file — it may have expired." };
+      if (blob.sizeBytes > MAX_BLOB_BYTES) {
+        blob.stream.destroy();
+        return {
+          ok: false,
+          message: `that file is ${blob.sizeBytes} bytes — too large to read inline (limit ${MAX_BLOB_BYTES}).`,
+        };
+      }
       const bytes = await collectBlob(blob.stream);
       if (!headLooksLikeText(bytes.subarray(0, 8000)))
         return { ok: true, sizeBytes: blob.sizeBytes, contentType: "application/octet-stream" };
@@ -417,9 +443,14 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       if (conversation.kind === "dm" || !conversation.channelRef)
         return { ok: false, message: "standing orders are per-channel — there isn't one for a DM." };
       const p = await deps.channelPolicy.get(conversation.channelRef);
-      return { ok: true, orders: p?.orders ?? "", ...(p?.bots && Object.keys(p.bots).length ? { bots: p.bots } : {}) };
+      return {
+        ok: true,
+        orders: p?.orders ?? "",
+        ...(p?.bots && Object.keys(p.bots).length ? { bots: p.bots } : {}),
+        ...(p?.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
+      };
     },
-    setStandingOrder: async (orders: string, bots?: Record<string, BotPolicy>) => {
+    setStandingOrder: async (orders: string, bots?: Record<string, BotPolicy>, ambientEnabled?: boolean | null) => {
       if (!deps.channelPolicy) return { ok: false, message: "standing orders aren't available on this turn" };
       if (conversation.kind === "dm" || !conversation.channelRef)
         return { ok: false, message: "standing orders are per-channel — you can only set one from inside a channel." };
@@ -433,6 +464,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         setBy: actor.id,
         bots: parsedBots,
         sessionId: session.id,
+        ambientEnabled,
       });
       deps.auditLog.record({
         at: Date.now(),
@@ -441,7 +473,12 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         resource: conversation.channelRef,
         scopeLabel: scopeId,
       });
-      return { ok: true, orders, ...(p.bots && Object.keys(p.bots).length ? { bots: p.bots } : {}) };
+      return {
+        ok: true,
+        orders,
+        ...(p.bots && Object.keys(p.bots).length ? { bots: p.bots } : {}),
+        ...(p.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
+      };
     },
     staySilent: async (reason: string) => {
       spine.staySilentReason = reason;
