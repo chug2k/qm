@@ -119,10 +119,47 @@ services:
       - dokploy-network
     restart: unless-stopped
 
+  # gatus-bridge shares dind's network namespace, and a container that shares
+  # another's netns loses its networking when that container restarts: it keeps
+  # reporting "running" while every outbound name lookup fails. dind restarted
+  # on 2026-08-26 and took the bridge's monitoring path down silently until
+  # 2026-09-09. depends_on cannot help; it orders startup and says nothing about
+  # a later restart.
+  #
+  # So the bridge now watches its own forward path and exits when it is gone,
+  # letting the restart policy recreate it in dind's current namespace. The
+  # probe MUST dial gatus-relay and not 127.0.0.1:18080 — loopback answers from
+  # inside a dead namespace, so a local-port healthcheck reports healthy right
+  # through the outage. Verified locally against a netns-restart reproduction.
   gatus-bridge:
     image: alpine/socat:latest
     network_mode: service:dind
-    command: ["TCP-LISTEN:18080,fork,reuseaddr", "TCP:gatus-relay:8080"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        socat TCP-LISTEN:18080,fork,reuseaddr TCP:gatus-relay:8080 &
+        listener=$$!
+        fails=0
+        while :; do
+          sleep 30
+          kill -0 "$$listener" 2>/dev/null || exit 1
+          if socat -T3 /dev/null TCP:gatus-relay:8080 >/dev/null 2>&1; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            [ "$$fails" -ge 3 ] && exit 1
+          fi
+        done
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "socat -T3 /dev/null TCP:127.0.0.1:18080 >/dev/null 2>&1 && socat -T3 /dev/null TCP:gatus-relay:8080 >/dev/null 2>&1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     depends_on:
       dind:
         condition: service_healthy
