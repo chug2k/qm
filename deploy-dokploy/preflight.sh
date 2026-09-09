@@ -87,17 +87,22 @@ compose=docker-compose.dokploy.yml
 for df in $(grep -oE 'dockerfile: [^ ]+' "$compose" | awk '{print $2}' | sort -u); do
   if [ -f "$df" ]; then ok "build file present: $df"; else bad "compose references a missing build file: $df"; fi
 done
-unmapped=""
-for v in $(grep -oE '\$\{[A-Z0-9_]+' "$compose" | sed 's/\${//' | sort -u); do
-  grep -qE "^\s+${v}:" "$compose" || unmapped="$unmapped $v"
-done
+required_vars() {
+  grep -vE '^\s*#' "$compose" \
+    | grep -oE '\$\{[A-Z0-9_]+(:-)?' \
+    | grep -v ':-' \
+    | sed 's/\${//' | sort -u
+}
 if [ -n "${DOKPLOY_ENV_FILE:-}" ] && [ -f "${DOKPLOY_ENV_FILE:-}" ]; then
   missing=""
-  for v in $(grep -oE '\$\{[A-Z0-9_]+' "$compose" | sed 's/\${//' | sort -u); do
+  for v in $(required_vars); do
     grep -qE "^${v}=" "$DOKPLOY_ENV_FILE" || missing="$missing $v"
   done
-  if [ -z "$missing" ]; then ok "every \${VAR} in the compose exists in $DOKPLOY_ENV_FILE"
-  else bad "set in compose but absent from the Dokploy env:$missing"; fi
+  if [ -z "$missing" ]; then
+    ok "every required \${VAR} in the compose is set in the Dokploy env ($(required_vars | wc -l | tr -d ' ') checked)"
+  else
+    bad "referenced by the compose with no default and absent from the Dokploy env:$missing"
+  fi
 else
   warn "set DOKPLOY_ENV_FILE=<blob> to check \${VAR} against the real Dokploy env (unmapped vars fail silently)"
 fi
