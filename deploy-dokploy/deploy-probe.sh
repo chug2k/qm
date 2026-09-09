@@ -49,11 +49,34 @@ done
 echo "$body" | head -c 150
 echo ""
 
+echo "== reap dead agent-deploy containers =="
+# Removing a corpse is the recovery path, not just tidying: resolveEndpoint
+# then reports the deployment gone and deploy-service re-applies it from its
+# stored snapshot on next access.
+for c in $(docker ps -a --filter 'name=^agent-deploy-' --format '{{.Names}}'); do
+  st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null)
+  if [ "$st" = "running" ]; then
+    echo "keep   $c (running)"
+  elif docker rm -f "$c" >/dev/null 2>&1; then
+    echo "reaped $c (was $st)"
+  else
+    echo "FAILED to reap $c (was $st)"
+  fi
+done
+
+echo "== core self-API reachability from a sandbox-equivalent =="
+# PUBLIC_API_URL becomes $AGENT_API_URL in every sandbox. Core rejects
+# unauthenticated calls, so any HTTP status proves the hop; a connection
+# error is the failure that matters.
+docker run --rm --network probe-net2 --add-host=host.docker.internal:host-gateway \
+  alpine:3.21 wget -S -q -O /dev/null -T 5 "http://host.docker.internal:8080/v1/apis" 2>&1 | head -3
+
 echo "== gatus relay: sandbox-equivalent end-to-end =="
 docker pull -q alpine:3.21 >/dev/null 2>&1
 docker network create probe-net >/dev/null 2>&1
+docker network create probe-net2 >/dev/null 2>&1
 docker run --rm --network probe-net --add-host=host.docker.internal:host-gateway \
   alpine:3.21 wget -q -O - -T 5 "http://host.docker.internal:18080/api/v1/endpoints/statuses" 2>&1 | head -c 150
 echo ""
-docker network rm probe-net >/dev/null 2>&1
+docker network rm probe-net probe-net2 >/dev/null 2>&1
 echo "=== probe done ==="

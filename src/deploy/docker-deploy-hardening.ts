@@ -90,6 +90,12 @@ export function hardenDockerDeploy(
     }
   };
 
+  const containerServing = async (name: string, endpoint: DeployEndpoint): Promise<boolean> => {
+    const st = await dexec(["inspect", "-f", "{{.State.Status}}", name]);
+    if (st.code !== 0 || st.stdout.trim() !== "running") return false;
+    return dial(endpoint.host, endpoint.port);
+  };
+
   const applyVerified = async (
     run: (p: DeployProvider) => Promise<DeployEndpoint>,
     d: Deployment,
@@ -138,9 +144,12 @@ export function hardenDockerDeploy(
       return current().destroy(d);
     },
 
-    resolveEndpoint(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint | null> {
+    async resolveEndpoint(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint | null> {
       const p = current();
-      return p.resolveEndpoint ? p.resolveEndpoint(d, version) : Promise.resolve(null);
+      if (!p.resolveEndpoint) return null;
+      const endpoint = await p.resolveEndpoint(d, version);
+      if (!endpoint) return null;
+      return (await containerServing(deployContainerName(d), endpoint)) ? endpoint : null;
     },
 
     logs(d: Deployment, o: { tailLines: number }): Promise<string | null> {

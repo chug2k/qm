@@ -176,7 +176,7 @@ services:
     network_mode: service:dind
     environment:
       DOCKER_HOST: tcp://127.0.0.1:2375
-      PROBE_REVISION: "4"
+      PROBE_REVISION: "5"
     entrypoint:
       [
         "/bin/sh",
@@ -210,6 +210,15 @@ services:
       ORG_ID: anduin
       PUBLIC_WEB_URL: https://qm-cl.anduincapital.dev
       WEB_UI_PUBLIC_URL: https://qm-cl.anduincapital.dev
+      # Completes the pair that switches on the agent-facing cron, webhook and
+      # share tools: core requires BOTH a signing secret and an api base url
+      # (src/core/orchestrator.ts, src/harness/agent-tools.ts). It also becomes
+      # $AGENT_API_URL inside every sandbox, so it must be reachable from a
+      # container nested in dind — NOT the public host, which has no Cloudflare
+      # Access identity and would silently answer a sign-in page. Sandboxes get
+      # --add-host=host.docker.internal:host-gateway, and core listens on 8080
+      # inside dind's namespace, so this is the address they can always reach.
+      PUBLIC_API_URL: http://host.docker.internal:8080
       HARNESS: claude
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
       SANDBOX_BACKEND: local

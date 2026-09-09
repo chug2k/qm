@@ -62,8 +62,13 @@ function dexecFor(dind: FakeDind): DockerExec {
       const name = args[args.length - 1]!;
       const c = dind.containers.get(name);
       if (!c) return fail(`Error: No such object: ${name}`);
-      if (args[1] === "--format") return ok(JSON.stringify({ [`${name}-net`]: {} }));
-      return ok(`${c.status} ${c.exitCode}`);
+      const fmt = args[args.indexOf(args.includes("-f") ? "-f" : "--format") + 1] ?? "";
+      if (fmt.includes("NetworkSettings.Networks")) return ok(JSON.stringify({ [`${name}-net`]: {} }));
+      return ok(
+        fmt
+          .replace(/\{\{\.State\.Status\}\}/g, c.status)
+          .replace(/\{\{\.State\.ExitCode\}\}/g, String(c.exitCode)),
+      );
     }
     if (cmd === "logs") {
       const c = dind.containers.get(args[args.length - 1]!);
@@ -171,4 +176,34 @@ test("destroy and logs reach the upstream provider", async () => {
   assert.equal(await p.logs!(d, { tailLines: 5 }), "");
   await p.destroy(d);
   assert.equal(dind.containers.size, 0);
+});
+
+test("resolveEndpoint reports a dead container as gone, so core re-applies it", async () => {
+  const dind = fakeDind();
+  const { d, v } = deployment("beefbeef-1111-2222");
+  const p = provider(dind);
+  const endpoint = await p.apply(d, v);
+  const live = { ...d, endpoint };
+
+  assert.deepEqual(await p.resolveEndpoint!(live, v), endpoint, "a serving container resolves");
+
+  const c = dind.containers.get(deployContainerName(d))!;
+  c.status = "exited";
+  c.exitCode = 255;
+  assert.equal(
+    await p.resolveEndpoint!(live, v),
+    null,
+    "an exited container must resolve to null; upstream returns the stale endpoint because docker inspect still succeeds",
+  );
+});
+
+test("resolveEndpoint reports a running container that stopped listening as gone", async () => {
+  const dind = fakeDind();
+  const { d, v } = deployment("cafecafe-3333-4444");
+  const p = provider(dind);
+  const endpoint = await p.apply(d, v);
+  const live = { ...d, endpoint };
+
+  dind.containers.get(deployContainerName(d))!.listening = false;
+  assert.equal(await p.resolveEndpoint!(live, v), null);
 });
