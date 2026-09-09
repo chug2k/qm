@@ -70,8 +70,17 @@ echo "== core self-API reachability from a sandbox-equivalent =="
 # error is the failure that matters.
 docker pull -q alpine:3.21 >/dev/null 2>&1
 docker network create probe-net2 >/dev/null 2>&1
-docker run --rm --network probe-net2 --add-host=host.docker.internal:host-gateway \
-  alpine:3.21 wget -S -q -O /dev/null -T 5 "http://host.docker.internal:8080/v1/apis" 2>&1 | head -3
+# This probe starts with dind and core boots alongside it, so retry: without
+# this the check reports "connection refused" on every fresh deploy purely
+# because it asked two seconds too early.
+i=0
+until out=$(docker run --rm --network probe-net2 --add-host=host.docker.internal:host-gateway \
+  alpine:3.21 wget -S -q -O /dev/null -T 5 "http://host.docker.internal:8080/v1/apis" 2>&1) ||
+  echo "$out" | grep -q "HTTP/1.1" || [ $i -ge 10 ]; do
+  i=$((i + 1))
+  sleep 3
+done
+echo "$out" | head -3
 docker network rm probe-net2 >/dev/null 2>&1
 
 echo "== gatus relay: sandbox-equivalent end-to-end =="
