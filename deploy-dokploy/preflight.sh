@@ -84,6 +84,11 @@ fi
 echo
 echo "4. Compose wiring"
 compose=docker-compose.dokploy.yml
+if git apply --check deploy-dokploy/core-dependencies.patch; then
+  ok "taincap dependency patch applies to the upstream npm manifests"
+else
+  bad "refresh deploy-dokploy/core-dependencies.patch for this upstream revision"
+fi
 for df in $(grep -oE 'dockerfile: [^ ]+' "$compose" | awk '{print $2}' | sort -u); do
   if [ -f "$df" ]; then ok "build file present: $df"; else bad "compose references a missing build file: $df"; fi
 done

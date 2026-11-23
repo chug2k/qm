@@ -199,7 +199,7 @@ services:
   core:
     build:
       context: .
-      dockerfile: deploy/core/Dockerfile
+      dockerfile: deploy-dokploy/core.Dockerfile
     network_mode: service:dind
     environment:
       PORT: "8080"

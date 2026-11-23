@@ -12,11 +12,11 @@ backend against a **dind sidecar** so everything stays on one box:
 
 - `dind` — privileged docker:dind. Hosts all agent sandbox containers and
   their `qm-home-*` volumes. The API binds to 127.0.0.1:2375 only.
-- `core` — built from `core-dind.Dockerfile` (upstream core image + docker
-  CLI). Runs with `network_mode: service:dind`: the local sandbox backend
-  publishes agent ports on the daemon's loopback and dials 127.0.0.1, so
-  core must share dind's network namespace. Other services reach core through
-  the `core` DNS alias on the dind service.
+- `core` uses `deploy-dokploy/core.Dockerfile` to apply
+  `core-dependencies.patch` to the npm manifests before the production install
+  and audit. It shares dind's network namespace so the local sandbox backend
+  can reach agent ports on loopback. Other services reach it through the
+  `core` DNS alias on dind.
 - `sandbox-image` — one-shot that builds `qm-sandbox-local:latest` inside
   dind from `fly/Dockerfile` + `local/Dockerfile`. Bump
   `SANDBOX_IMAGE_REVISION` in the Dokploy env to force a rebuild.
